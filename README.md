@@ -1,6 +1,12 @@
-# Cheboo
+<p align="center">
+  <img src="macos/Cheboo/Resources/Assets.xcassets/AppIcon.appiconset/icon_512.png" alt="Cheboo" width="160" height="160">
+</p>
 
-Push-to-talk dictation powered by [Deepgram](https://deepgram.com) Nova-3. Two apps share a single audio + transcription core:
+<h1 align="center">Cheboo</h1>
+
+<p align="center">Push-to-talk dictation powered by <a href="https://deepgram.com">Deepgram</a> Nova-3.</p>
+
+Two apps share a single audio + transcription core:
 
 - **macOS** — menubar-resident hotkey. Hold a key anywhere, speak, release, and the transcript is typed into whatever app has focus.
 - **iOS** — tap-to-record companion. Live partials while you talk, then an editable transcript you can copy, share, or save to history.
