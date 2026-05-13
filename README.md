@@ -18,8 +18,7 @@ The pipeline is the same on both: 16 kHz mono Int16 PCM → Deepgram streaming W
 ```
 cheboo/
 ├── macos/         # Menubar app (Swift / AppKit / SwiftUI)
-├── ios/           # Standalone app (Swift / SwiftUI / SwiftData)
-└── scripts/       # Dev utilities (e.g. relocating CoreSimulator to an external disk)
+└── ios/           # Standalone app (Swift / SwiftUI / SwiftData)
 ```
 
 Each app builds independently from its own `project.yml` (XcodeGen). See:
