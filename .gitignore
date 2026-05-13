@@ -1,0 +1,86 @@
+# ---- XcodeGen-generated projects ----
+# Both apps are regenerated from project.yml; never commit the generated .xcodeproj.
+*.xcodeproj/
+!*.xcodeproj/project.pbxproj.placeholder
+**/Cheboo.xcodeproj/
+
+# ---- Xcode build artifacts ----
+build/
+DerivedData/
+*.xcuserdatad/
+*.xcworkspace/xcuserdata/
+xcuserdata/
+*.xcuserstate
+*.xcscmblueprint
+*.moved-aside
+*.pbxuser
+!default.pbxuser
+*.mode1v3
+!default.mode1v3
+*.mode2v3
+!default.mode2v3
+*.perspectivev3
+!default.perspectivev3
+*.hmap
+*.ipa
+*.dSYM.zip
+*.dSYM
+timeline.xctimeline
+playground.xcworkspace
+
+# ---- Swift Package Manager ----
+.build/
+.swiftpm/
+Packages/
+Package.resolved
+*.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/
+
+# ---- CocoaPods (not used today, but cheap insurance) ----
+Pods/
+Podfile.lock
+
+# ---- Carthage (same) ----
+Carthage/Build/
+Carthage/Checkouts/
+
+# ---- fastlane (same) ----
+fastlane/report.xml
+fastlane/Preview.html
+fastlane/screenshots/**/*.png
+fastlane/test_output
+
+# ---- Signing artifacts ----
+# Never commit certificates or provisioning profiles.
+*.cer
+*.p12
+*.p8
+*.pem
+*.mobileprovision
+*.provisionprofile
+
+# ---- Secrets ----
+# Belt-and-suspenders — the app stores keys in Keychain, not on disk, but
+# refuse anything that looks like a local override slipping in.
+.env
+.env.*
+secrets.*
+credentials.*
+*.local.json
+!.claude/settings.local.json.example
+
+# ---- Local tooling state ----
+.claude/
+.cursor/
+.vscode/
+.idea/
+
+# ---- macOS / editor junk ----
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon?
+._*
+*.swp
+*.swo
+*~
+.netrwhist

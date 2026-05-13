@@ -1,0 +1,407 @@
+import AppKit
+import Combine
+import Foundation
+
+/// Orchestrates the press-to-talk pipeline: hotkey → audio capture →
+/// transcription engine → text injection + HUD.
+///
+/// Owned by the SwiftUI scene as a `@StateObject`. Delegate callbacks from
+/// audio and engine queues hop to the main thread before mutating any
+/// published state.
+final class DictationController: ObservableObject {
+    enum Status: Equatable {
+        case idle
+        case waitingForPermission(String)
+        case connecting
+        case recording
+        case error(String)
+
+        var label: String {
+            switch self {
+            case .idle: return "Idle"
+            case .waitingForPermission(let what): return "Needs \(what) access"
+            case .connecting: return "Connecting…"
+            case .recording: return "Recording"
+            case .error(let message): return "Error: \(message)"
+            }
+        }
+    }
+
+    @Published private(set) var status: Status = .idle
+    @Published private(set) var interimText = ""
+    @Published private(set) var isRecording = false
+
+    private let audio = AudioEngine()
+    private let injector = TextInjector()
+    private let hud = HUDOverlay()
+    private let subtitles = SubtitleOverlay()
+    private let hotkey = HotkeyManager(id: 1)
+    private let pasteHotkey = HotkeyManager(id: 2)
+    private let clearSubtitlesHotkey = HotkeyManager(id: 3)
+    private var engine: TranscriptionEngine?
+
+    private var settings: SettingsStore?
+    private var injectedSomething = false
+
+    init() {
+        audio.delegate = self
+        hotkey.onPress = { [weak self] in self?.handleHotkeyPress() }
+        hotkey.onRelease = { [weak self] in self?.handleHotkeyRelease() }
+        pasteHotkey.onPress = { [weak self] in self?.flushBufferNow() }
+        clearSubtitlesHotkey.onPress = { [weak self] in self?.subtitles.clear() }
+        hud.onRestartRequested = { [weak self] in self?.restartSession() }
+    }
+
+    /// Tear down the active dictation session and immediately open a new one
+    /// so changed connection-time params (punctuation / capitalization) take
+    /// effect. Whatever's currently on the HUD gets typed first so the user
+    /// doesn't lose it.
+    private func restartSession() {
+        guard isRecording else { return }
+        stop()
+        start()
+    }
+
+    private func handleHotkeyPress() {
+        switch settings?.hotkeyBehavior ?? .pushToTalk {
+        case .pushToTalk:
+            start()
+        case .toggle:
+            if isRecording { stop() } else { start() }
+        }
+    }
+
+    private func handleHotkeyRelease() {
+        switch settings?.hotkeyBehavior ?? .pushToTalk {
+        case .pushToTalk:
+            stop()
+        case .toggle:
+            break
+        }
+    }
+
+    func bind(settings: SettingsStore) {
+        self.settings = settings
+        hud.bind(settings: settings)
+        subtitles.bind(settings: settings)
+        applyHotkey()
+    }
+
+    func applyHotkey() {
+        guard let settings else { return }
+        hotkey.register(keyCode: settings.hotkeyKeyCode, modifiers: settings.hotkeyModifiers)
+        pasteHotkey.register(
+            keyCode: settings.pasteHotkeyKeyCode,
+            modifiers: settings.pasteHotkeyModifiers
+        )
+        clearSubtitlesHotkey.register(
+            keyCode: settings.clearSubtitlesHotkeyKeyCode,
+            modifiers: settings.clearSubtitlesHotkeyModifiers
+        )
+    }
+
+    /// Manual flush: type whatever the HUD is currently showing into the
+    /// focused input, then clear it. Used when the user wants the buffer
+    /// in the input without waiting for endpointing.
+    private func flushBufferNow() {
+        guard !interimText.isEmpty else { return }
+        let buffer = interimText
+        interimText = ""
+        if settings?.showHUD == true {
+            hud.update(text: "")
+        }
+        injector.type(formatChunk(buffer))
+        injectedSomething = true
+    }
+
+    // MARK: Lifecycle
+
+    private func start() {
+        guard !isRecording, let settings else { return }
+        Log.dictation.info("start requested — engine=\(settings.engineKind.rawValue, privacy: .public)")
+
+        // If a previous session is still draining detach it now so its late
+        // delegate callbacks can't inject into the new session.
+        if let prior = engine {
+            prior.delegate = nil
+            prior.stop()
+            engine = nil
+            hud.hide()
+        }
+
+        if Permissions.microphoneStatus() != .authorized {
+            status = .waitingForPermission("Microphone")
+            Permissions.requestMicrophone { granted in
+                if granted { /* user can press again */ }
+            }
+            return
+        }
+        guard Permissions.hasAccessibility() else {
+            status = .waitingForPermission("Accessibility")
+            Permissions.promptAccessibility()
+            return
+        }
+
+        let language = settings.languageMode.resolved()
+        let newEngine: TranscriptionEngine
+        switch settings.engineKind {
+        case .deepgram:
+            guard !settings.apiKey.isEmpty else {
+                status = .error("Set a Deepgram API key in Settings.")
+                return
+            }
+            newEngine = DeepgramSocket(
+                apiKey: settings.apiKey,
+                model: language.deepgramModel,
+                language: language.deepgramLanguage,
+                punctuate: settings.autoPunctuation,
+                smartFormat: settings.autoCapitalization,
+                keyterms: settings.activeKeyterms
+            )
+        case .whisperServer:
+            guard !settings.whisperServerURL.isEmpty else {
+                status = .error("Set a Whisper server URL in Settings → Engine.")
+                return
+            }
+            newEngine = WhisperServerEngine(
+                baseURL: settings.whisperServerURL,
+                apiKey: settings.whisperServerAPIKey,
+                language: language.whisperLanguage
+            )
+        }
+
+        injectedSomething = false
+        interimText = ""
+        status = .connecting
+
+        newEngine.delegate = self
+        newEngine.start()
+        self.engine = newEngine
+
+        do {
+            try audio.start()
+            isRecording = true
+            status = .recording
+            hud.markSettingsApplied()
+            if settings.showHUD {
+                hud.setAnchor(settings.hudPosition == .below ? .below : .above)
+                hud.show(text: "")
+            }
+            // Subtitle overlay reappears on its own when interim/final text
+            // arrives — no need to show an empty band here.
+        } catch {
+            Log.dictation.error("audio start failed: \(error.localizedDescription, privacy: .public)")
+            status = .error(error.localizedDescription)
+            newEngine.stop()
+            self.engine = nil
+        }
+    }
+
+    private func stop() {
+        guard isRecording else {
+            // If we were mid-connect, tear it down anyway.
+            engine?.stop()
+            engine = nil
+            return
+        }
+        Log.dictation.info("stop requested")
+        audio.stop()
+        isRecording = false
+        let flushed = interimText
+        interimText = ""
+        status = .idle
+        hud.hide()
+        // Subtitle mode persists what was said until the user explicitly
+        // clears it with the clear-subtitles hotkey, so we don't hide here.
+        // Any interim that hadn't yet been finalized gets committed so the
+        // visible text matches what was typed.
+        if settings?.subtitleMode == true, !flushed.isEmpty {
+            subtitles.commit(text: flushed)
+        }
+
+        if !flushed.isEmpty {
+            // We already see the transcript on screen — type it and detach
+            // the engine so its post-stop final can't double-type.
+            engine?.delegate = nil
+            engine?.stop()
+            engine = nil
+            injector.type(formatChunk(flushed))
+            injectedSomething = true
+        } else {
+            // Nothing on screen yet (no interim received). Stop the engine
+            // but leave the delegate attached briefly so any post-stop final
+            // still injects through the normal path. No HUD spinner — the
+            // user moves on and the late text just appears.
+            engine?.stop()
+        }
+    }
+
+    // MARK: Injection formatting
+
+    /// Prepend a space if we've already typed something this utterance and the
+    /// incoming chunk doesn't start with punctuation/whitespace. Also fix the
+    /// frequent Deepgram quirk where the first letter after `", "` comes back
+    /// capitalized mid-sentence — proper-noun detection is impractical, so we
+    /// just lowercase and accept the occasional miscased name.
+    private func formatChunk(_ chunk: String) -> String {
+        let normalized = Self.lowercaseAfterComma(chunk)
+        guard injectedSomething else { return normalized }
+        if let first = normalized.first {
+            if first.isWhitespace { return normalized }
+            if ",.!?;:".contains(first) { return normalized }
+        }
+        return " " + normalized
+    }
+
+    /// Spoken-punctuation map. Each entry is a regex that swallows the word
+    /// (plus any surrounding whitespace) and inserts the literal mark with
+    /// one trailing space. Order matters — multi-word commands come before
+    /// the single-word ones so e.g. "точка с запятой" wins over "запятая".
+    /// We do this client-side instead of `dictation=true` on Deepgram because
+    /// (a) Deepgram's dictation feature is English-only — "запятая" wouldn't
+    /// be recognized — and (b) `dictation=true` requires `punctuate=true`,
+    /// which would also re-enable prosody-based punctuation that the user
+    /// explicitly opted out of.
+    private static let commandPatterns: [(NSRegularExpression, String)] = {
+        let raw: [(String, String)] = [
+            (#"\s*\bточка с запятой\b\s*"#, "; "),
+            (#"\s*\bsemicolon\b\s*"#, "; "),
+            (#"\s*\b(?:exclamation mark|exclamation point|восклицательный знак)\b\s*"#, "! "),
+            (#"\s*\b(?:question mark|вопросительный знак)\b\s*"#, "? "),
+            (#"\s*\b(?:new paragraph|новый абзац)\b\s*"#, "\n\n"),
+            (#"\s*\b(?:new line|новая строка)\b\s*"#, "\n"),
+            (#"\s*\b(?:comma|запятая)\b\s*"#, ", "),
+            (#"\s*\b(?:period|точка)\b\s*"#, ". "),
+            (#"\s*\b(?:colon|двоеточие)\b\s*"#, ": "),
+            (#"\s*\b(?:dash|тире)\b\s*"#, " — "),
+            (#"\s*\b(?:hyphen|дефис)\b\s*"#, "-"),
+        ]
+        return raw.compactMap { pattern, replacement in
+            guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive])
+            else { return nil }
+            return (regex, NSRegularExpression.escapedTemplate(for: replacement))
+        }
+    }()
+
+    /// Replace spoken punctuation commands ("comma", "запятая", "question mark",
+    /// "новая строка", …) with their literal marks. Idempotent — running it
+    /// twice produces the same result, since the replacements don't themselves
+    /// contain command words.
+    static func substituteCommands(_ s: String) -> String {
+        var result = s
+        for (regex, template) in commandPatterns {
+            let range = NSRange(location: 0, length: (result as NSString).length)
+            result = regex.stringByReplacingMatches(
+                in: result,
+                options: [],
+                range: range,
+                withTemplate: template
+            )
+        }
+        return result
+    }
+
+    private static func lowercaseAfterComma(_ s: String) -> String {
+        guard let regex = try? NSRegularExpression(pattern: #", (\p{Lu})"#) else { return s }
+        let ns = s as NSString
+        let matches = regex.matches(in: s, range: NSRange(location: 0, length: ns.length))
+        guard !matches.isEmpty else { return s }
+        var result = s
+        for match in matches.reversed() {
+            let range = match.range(at: 1)
+            let upper = (result as NSString).substring(with: range)
+            let lower = upper.lowercased()
+            result = (result as NSString).replacingCharacters(in: range, with: lower)
+        }
+        return result
+    }
+}
+
+// MARK: - Audio delegate
+
+extension DictationController: AudioEngineDelegate {
+    func audioEngine(_ engine: AudioEngine, didCapture pcm: Data) {
+        // Called from AudioEngine.callbackQueue; engine.send is thread-safe.
+        self.engine?.send(pcm)
+    }
+
+    func audioEngine(_ engine: AudioEngine, didFailWith error: Error) {
+        DispatchQueue.main.async { [weak self] in
+            Log.dictation.error("audio engine failed: \(error.localizedDescription, privacy: .public)")
+            self?.status = .error(error.localizedDescription)
+            self?.stop()
+        }
+    }
+}
+
+// MARK: - Transcription engine delegate
+
+extension DictationController: TranscriptionEngineDelegate {
+    func engineDidOpen(_ engine: TranscriptionEngine) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.isRecording else { return }
+            self.status = .recording
+        }
+    }
+
+    func engine(_ engine: TranscriptionEngine, didReceiveInterim text: String) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.isRecording else { return }
+            let processed = Self.substituteCommands(text)
+            self.interimText = processed
+            if self.settings?.showHUD == true {
+                self.hud.update(text: processed)
+            }
+            if self.settings?.subtitleMode == true {
+                self.subtitles.setInterim(text: processed)
+            }
+        }
+    }
+
+    func engine(_ engine: TranscriptionEngine, didReceiveFinal text: String, speechFinal: Bool) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self, let settings = self.settings else { return }
+
+            let processed = Self.substituteCommands(text)
+
+            // Subtitle accumulation is independent of injection — we always
+            // commit finals into the on-screen buffer when subtitle mode is
+            // on, regardless of `injectOnFinal` or `speechFinal`.
+            if settings.subtitleMode {
+                self.subtitles.commit(text: processed)
+            }
+
+            // After tap-stop, isRecording is false but the engine may still
+            // deliver one last final from its flush; type it anyway so
+            // nothing's lost. injectOnFinal is only consulted while we're
+            // actively recording.
+            let postStop = !self.isRecording
+            let shouldInject = postStop || settings.injectOnFinal || speechFinal
+            guard shouldInject else { return }
+
+            self.injector.type(self.formatChunk(processed))
+            self.injectedSomething = true
+            self.interimText = ""
+
+            if postStop {
+                self.engine?.delegate = nil
+                self.engine?.stop()
+                self.engine = nil
+            } else if settings.showHUD {
+                self.hud.update(text: "")
+            }
+        }
+    }
+
+    func engine(_ engine: TranscriptionEngine, didCloseWith error: Error?) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.engine = nil
+            if let error, self.isRecording {
+                Log.dictation.error("engine closed with error: \(error.localizedDescription, privacy: .public)")
+                self.status = .error(error.localizedDescription)
+                self.stop()
+            }
+        }
+    }
+}
