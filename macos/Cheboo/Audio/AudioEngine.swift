@@ -35,6 +35,12 @@ extension AudioEngineDelegate {
 /// 3. The `AVAudioEngine` instance is recreated whenever a config change fires
 ///    or an install-tap exception comes back — the prior instance may carry
 ///    poisoned state from the moment the device disappeared.
+///
+/// On top of that, when a config change fires *while we're recording* we try a
+/// seamless in-place rebuild before giving up. This catches the common AirPods
+/// case where speaking flips the headset between A2DP and HFP profiles and the
+/// notification arrives a few ms into the session — a session-killing error
+/// would be jarring when the device is in fact still there.
 final class AudioEngine {
     weak var delegate: AudioEngineDelegate?
 
@@ -54,6 +60,21 @@ final class AudioEngine {
     /// listener can decide whether a change in available devices actually
     /// warrants a restart.
     private var activeInputDeviceID: AudioDeviceID = 0
+    /// Timestamps of recent in-flight seamless rebuilds, used to cap how
+    /// many we'll absorb before falling back to surfacing the error. Some
+    /// hardware (notably AirPods) can fire several config changes in a row
+    /// while switching profiles; we want to ride out the first few, but a
+    /// runaway loop usually means a real device-loss situation.
+    private var recentSeamlessRestarts: [Date] = []
+    private let seamlessRestartWindow: TimeInterval = 10
+    private let seamlessRestartLimit = 3
+    /// The input format the engine settled on the last time we successfully
+    /// started or rebuilt. Used to filter out spurious
+    /// `AVAudioEngineConfigurationChange` notifications where nothing
+    /// material actually changed — both AVAudioEngine internals and our own
+    /// device rebinding will fire that notification, and rebuilding in
+    /// response to a no-op change creates an infinite loop.
+    private var lastStableInputFormat: AVAudioFormat?
     private var deviceListenerBlock: AudioObjectPropertyListenerBlock?
     private var deviceListenerAddress = AudioObjectPropertyAddress(
         mSelector: kAudioHardwarePropertyDevices,
@@ -182,6 +203,7 @@ final class AudioEngine {
             throw error
         }
         isRunning = true
+        lastStableInputFormat = inputFormat
         Log.audio.info("audio engine started")
     }
 
@@ -211,6 +233,7 @@ final class AudioEngine {
             activeInputDeviceID = InputDevices.defaultInputDeviceID() ?? 0
             return
         }
+        let before = readBoundDeviceID(of: inputUnit)
         var deviceID = target
         let propSize = UInt32(MemoryLayout<AudioDeviceID>.size)
         let status = AudioUnitSetProperty(
@@ -226,8 +249,29 @@ final class AudioEngine {
             activeInputDeviceID = InputDevices.defaultInputDeviceID() ?? 0
         } else {
             activeInputDeviceID = target
-            Log.audio.info("bound input device id=\(target, privacy: .public) uid=\(self.preferredInputUID ?? "(default)", privacy: .public)")
+            let after = readBoundDeviceID(of: inputUnit)
+            Log.audio.info(
+                "bound input device target=\(target, privacy: .public) before=\(before, privacy: .public) after=\(after, privacy: .public) uid=\(self.preferredInputUID ?? "(default)", privacy: .public)"
+            )
         }
+    }
+
+    /// Read the device currently bound to the input AU. Used in diagnostics
+    /// to verify our `kAudioOutputUnitProperty_CurrentDevice` writes actually
+    /// stuck and to detect cases where macOS later swaps the AU off our
+    /// chosen device behind our back.
+    private func readBoundDeviceID(of unit: AudioUnit) -> AudioDeviceID {
+        var value: AudioDeviceID = 0
+        var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+        let status = AudioUnitGetProperty(
+            unit,
+            kAudioOutputUnitProperty_CurrentDevice,
+            kAudioUnitScope_Global,
+            0,
+            &value,
+            &size
+        )
+        return status == noErr ? value : 0
     }
 
     private func observeDeviceList() {
@@ -279,10 +323,14 @@ final class AudioEngine {
     }
 
     /// Called on the main thread when CoreAudio swaps the active input or
-    /// output device, or when another app takes the device exclusively. If
-    /// we're idle, drop cached state so the next `start()` re-queries fresh.
-    /// If we're recording, fail the session — restarting in-flight is rarely
-    /// what the user wants when GarageBand-class apps grab the device.
+    /// output device, when another app takes the device exclusively, or when
+    /// a connected Bluetooth headset (AirPods!) flips between A2DP and HFP
+    /// profiles in response to the input session starting. If we're idle, drop
+    /// cached state so the next `start()` re-queries fresh. If we're
+    /// recording, attempt one in-place rebuild before giving up — that's
+    /// almost always what the user wants for a benign route change. If the
+    /// rebuild fails, or we've already absorbed too many in a row, fall back
+    /// to surfacing an error.
     private func handleConfigurationChange() {
         Log.audio.notice("AVAudioEngineConfigurationChange fired (isRunning=\(self.isRunning, privacy: .public))")
 
@@ -290,34 +338,84 @@ final class AudioEngine {
             // Tear down any leftover tap/converter so a future start() begins
             // from a clean slate. The engine instance itself may still be
             // poisoned by the device disappearing; recreate it preemptively.
-            engine.inputNode.removeTap(onBus: 0)
-            converter = nil
-            engine.stop()
-            engine = AVAudioEngine()
-            observeConfigChanges()
+            resetEngineInstance()
             return
         }
 
-        // We were actively recording. Stop cleanly, surface an error, and let
-        // the user re-press the hotkey when the other app has released the
-        // device. Trying to silently rebuild in-flight risks the very crash
-        // we're guarding against.
+        // The notification fires on every internal reconfiguration —
+        // including the one our own startEngine() causes when it binds
+        // `kAudioOutputUnitProperty_CurrentDevice` on a fresh engine. If the
+        // input format and the resolved preferred device are both unchanged
+        // from the state we last stabilized at, there is nothing to rebuild
+        // for and reacting would loop forever. Detect that and bail.
+        let currentFormat = engine.inputNode.outputFormat(forBus: 0)
+        let preferredTarget = resolveTargetDeviceID()
+        if let last = lastStableInputFormat,
+           currentFormat.sampleRate == last.sampleRate,
+           currentFormat.channelCount == last.channelCount,
+           currentFormat.sampleRate > 0,
+           currentFormat.channelCount > 0,
+           preferredTarget != 0,
+           preferredTarget == activeInputDeviceID
+        {
+            Log.audio.info(
+                "config change is benign (device id=\(self.activeInputDeviceID, privacy: .public), format unchanged) — ignoring"
+            )
+            return
+        }
+
+        if shouldAttemptSeamlessRestart() {
+            Log.audio.notice("attempting seamless audio engine rebuild")
+            resetEngineInstance()
+            do {
+                try startEngine()
+                Log.audio.info("seamless rebuild succeeded")
+                return
+            } catch {
+                // Genuine device loss — fall through to the failure path.
+                Log.audio.error("seamless rebuild failed: \(error.localizedDescription, privacy: .public)")
+                isRunning = false
+                callbackQueue.async { [weak self] in
+                    guard let self else { return }
+                    self.delegate?.audioEngine(self, didFailWith: error)
+                }
+                return
+            }
+        }
+
+        Log.audio.notice("seamless-restart budget exhausted — surfacing error")
         let err = NSError(
             domain: "AudioEngine",
             code: -2,
             userInfo: [NSLocalizedDescriptionKey: "Audio device changed — recording stopped. Press the hotkey to resume."]
         )
-        engine.inputNode.removeTap(onBus: 0)
-        engine.stop()
-        converter = nil
         isRunning = false
-        engine = AVAudioEngine()
-        observeConfigChanges()
+        resetEngineInstance()
 
         callbackQueue.async { [weak self] in
             guard let self else { return }
             self.delegate?.audioEngine(self, didFailWith: err)
         }
+    }
+
+    /// Tear down the current `AVAudioEngine` instance and replace it with a
+    /// fresh one, re-registering the config-change observer against the new
+    /// engine. The prior instance may still be holding poisoned state from
+    /// the route change that triggered us, so we don't try to reuse it.
+    private func resetEngineInstance() {
+        engine.inputNode.removeTap(onBus: 0)
+        engine.stop()
+        converter = nil
+        engine = AVAudioEngine()
+        observeConfigChanges()
+    }
+
+    private func shouldAttemptSeamlessRestart() -> Bool {
+        let now = Date()
+        recentSeamlessRestarts.removeAll { now.timeIntervalSince($0) > seamlessRestartWindow }
+        guard recentSeamlessRestarts.count < seamlessRestartLimit else { return false }
+        recentSeamlessRestarts.append(now)
+        return true
     }
 
     // MARK: - Tap processing
