@@ -5,6 +5,7 @@ import SwiftUI
 struct SettingsView: View {
     @EnvironmentObject private var settings: SettingsStore
     @EnvironmentObject private var dictation: DictationController
+    @StateObject private var inputDevices = InputDeviceMonitor.shared
 
     var body: some View {
         TabView {
@@ -69,6 +70,22 @@ struct SettingsView: View {
 
     private var generalTab: some View {
         Form {
+            Section("Microphone") {
+                Picker("Input device", selection: micSelectionBinding) {
+                    Text("System default").tag(String?.none)
+                    if let uid = settings.preferredInputDeviceUID,
+                       !inputDevices.devices.contains(where: { $0.uid == uid }) {
+                        Text("\(savedDeviceLabel(uid)) (disconnected)").tag(String?.some(uid))
+                    }
+                    ForEach(inputDevices.devices) { device in
+                        Text(device.name).tag(String?.some(device.uid))
+                    }
+                }
+                Text(micHint)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
             Section("Hotkey") {
                 HStack(spacing: 8) {
                     Toggle("⌘", isOn: modBinding(.command))
@@ -242,6 +259,33 @@ struct SettingsView: View {
         }
     }
 
+    private var micHint: String {
+        guard let uid = settings.preferredInputDeviceUID else {
+            return "Follows whichever input macOS currently treats as default."
+        }
+        let attached = inputDevices.devices.contains(where: { $0.uid == uid })
+        if attached {
+            return "Cheboo records from this device. If it's disconnected mid-session, we fall back to the system default and switch back when it returns."
+        }
+        return "The chosen device isn't attached right now — Cheboo will use the system default until it reappears."
+    }
+
+    private var micSelectionBinding: Binding<String?> {
+        Binding(
+            get: { settings.preferredInputDeviceUID },
+            set: { settings.preferredInputDeviceUID = $0 }
+        )
+    }
+
+    private func savedDeviceLabel(_ uid: String) -> String {
+        // Pure-UID strings aren't human-friendly. We don't have the name
+        // cached past unplug, so surface a trimmed form of the UID instead.
+        if let suffix = uid.split(separator: ":").last, !suffix.isEmpty {
+            return String(suffix)
+        }
+        return uid
+    }
+
     private var hotkeyHint: String {
         switch settings.hotkeyBehavior {
         case .pushToTalk:
@@ -297,24 +341,22 @@ struct SettingsView: View {
     @State private var editingListName: String = ""
 
     private var keytermsTab: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: 12) {
             Text("Keyterms bias Deepgram toward project- and shell-specific vocabulary. Keep separate lists per project; pick one (or none) to send at connect time. Up to 100 terms per list are sent.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
 
-            Picker("Active list", selection: activeListBinding) {
-                Text("— None (no keyterms) —").tag(UUID?.none)
-                ForEach(settings.keytermLists) { list in
-                    Text(list.name).tag(UUID?.some(list.id))
+            HStack(spacing: 8) {
+                Picker("Active list", selection: activeListBinding) {
+                    Text("— None (no keyterms) —").tag(UUID?.none)
+                    ForEach(settings.keytermLists) { list in
+                        Text(list.name).tag(UUID?.some(list.id))
+                    }
                 }
-            }
-
-            HStack(spacing: 12) {
-                Text("Lists").font(.headline)
-                Spacer()
                 Button {
                     let new = KeytermList(name: uniqueListName("New list"), terms: [])
                     settings.keytermLists.append(new)
+                    settings.selectedKeytermListID = new.id
                     editingListID = new.id
                     editingListName = new.name
                 } label: {
@@ -322,25 +364,38 @@ struct SettingsView: View {
                 }
             }
 
-            List {
-                ForEach(settings.keytermLists) { list in
-                    keytermListSection(list)
-                }
+            if let activeID = settings.selectedKeytermListID,
+               let list = settings.keytermLists.first(where: { $0.id == activeID }) {
+                activeListEditor(list)
+            } else {
+                Text("No list selected — Cheboo won't send any keyterms when dictating. Pick a list above to edit it, or create a new one.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .padding(.top, 8)
             }
-            .frame(minHeight: 280)
+            Spacer(minLength: 0)
         }
     }
 
     private var activeListBinding: Binding<UUID?> {
         Binding(
             get: { settings.selectedKeytermListID },
-            set: { settings.selectedKeytermListID = $0 }
+            set: { newValue in
+                settings.selectedKeytermListID = newValue
+                // Switching away cancels any in-progress rename for the
+                // previously-active list so the editor doesn't reappear
+                // pre-armed when the user comes back.
+                if editingListID != newValue {
+                    editingListID = nil
+                    editingListName = ""
+                }
+            }
         )
     }
 
     @ViewBuilder
-    private func keytermListSection(_ list: KeytermList) -> some View {
-        Section {
+    private func activeListEditor(_ list: KeytermList) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
             HStack {
                 if editingListID == list.id {
                     TextField("Name", text: $editingListName, onCommit: {
@@ -350,34 +405,35 @@ struct SettingsView: View {
                     Button("Done") { commitListRename(for: list.id) }
                 } else {
                     Text(list.name).font(.headline)
-                    if settings.selectedKeytermListID == list.id {
-                        Text("· active").font(.caption).foregroundStyle(.secondary)
-                    }
                     Spacer()
                     Button {
                         editingListID = list.id
                         editingListName = list.name
                     } label: { Image(systemName: "pencil") }
                     .buttonStyle(.borderless)
+                    .help("Rename list")
                     Button {
                         if let idx = settings.keytermLists.firstIndex(where: { $0.id == list.id }) {
                             let copy = KeytermList(name: uniqueListName(list.name + " copy"), terms: list.terms)
                             settings.keytermLists.insert(copy, at: idx + 1)
+                            settings.selectedKeytermListID = copy.id
                         }
                     } label: { Image(systemName: "doc.on.doc") }
                     .buttonStyle(.borderless)
+                    .help("Duplicate list")
                     Button {
                         settings.keytermLists.removeAll { $0.id == list.id }
-                        if settings.selectedKeytermListID == list.id {
-                            settings.selectedKeytermListID = nil
-                        }
+                        settings.selectedKeytermListID = nil
+                        editingListID = nil
+                        editingListName = ""
                     } label: { Image(systemName: "trash") }
                     .buttonStyle(.borderless)
+                    .help("Delete list")
                 }
             }
 
             HStack {
-                TextField("Add term to \(list.name)…", text: $newTerm)
+                TextField("Add term…", text: $newTerm)
                     .textFieldStyle(.roundedBorder)
                     .onSubmit { addTerm(to: list.id) }
                 Button("Add") { addTerm(to: list.id) }
@@ -390,20 +446,23 @@ struct SettingsView: View {
                 }
             }
 
-            ForEach(list.terms, id: \.self) { term in
-                HStack {
-                    Text(term)
-                    Spacer()
-                    Button {
-                        if let idx = settings.keytermLists.firstIndex(where: { $0.id == list.id }) {
-                            settings.keytermLists[idx].terms.removeAll { $0 == term }
+            List {
+                ForEach(list.terms, id: \.self) { term in
+                    HStack {
+                        Text(term)
+                        Spacer()
+                        Button {
+                            if let idx = settings.keytermLists.firstIndex(where: { $0.id == list.id }) {
+                                settings.keytermLists[idx].terms.removeAll { $0 == term }
+                            }
+                        } label: {
+                            Image(systemName: "minus.circle")
                         }
-                    } label: {
-                        Image(systemName: "minus.circle")
+                        .buttonStyle(.borderless)
                     }
-                    .buttonStyle(.borderless)
                 }
             }
+            .frame(minHeight: 240)
         }
     }
 

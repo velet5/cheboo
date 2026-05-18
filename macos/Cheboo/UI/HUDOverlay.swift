@@ -2,11 +2,11 @@ import AppKit
 import Combine
 
 /// Borderless floating panel that shows interim transcript text near the
-/// mouse cursor while dictation is active. Position can be anchored above
-/// or below the cursor (configurable) and the user can drag the panel to
-/// reposition it; once dragged, it sticks at the new spot for the rest of
-/// the session — until the user changes the anchor setting, which re-arms
-/// auto-positioning so the new preference takes effect on the next show.
+/// mouse cursor while dictation is active. Single line, black text on a
+/// white background, no chrome or controls. Text starts at the leading
+/// edge and grows rightward; once it can no longer fit, alignment flips
+/// so the trailing edge stays anchored at the right and older content
+/// slides off the left with a head ellipsis ("running line").
 ///
 /// All methods touch AppKit and must be invoked on the main thread; the type
 /// is intentionally not `@MainActor` so it can be stored on non-isolated
@@ -17,21 +17,16 @@ final class HUDOverlay: NSObject, NSWindowDelegate {
         case below
     }
 
+    /// Newlines are collapsed to this glyph (U+23CE RETURN SYMBOL) so the
+    /// HUD stays single-line while still showing the user when a paragraph
+    /// or hard break came through. Padded with spaces so it reads as a
+    /// discrete token rather than glued to neighboring words.
+    private static let returnGlyph = " ⏎ "
+
     private var window: NSPanel?
     private var label: NSTextField?
-    private var punctuateBox: NSButton?
-    private var capitalizeBox: NSButton?
-    private var restartButton: NSButton?
     private var anchor: Anchor = .above
     private let maxTailChars = 220
-    /// Snapshot of the toggles when the current dictation session connected.
-    /// Deepgram only reads these at connect time, so changing a checkbox
-    /// mid-session is inert until we tear down and reconnect — we expose a
-    /// restart button while the live values differ from this snapshot.
-    private var appliedPunctuation: Bool = false
-    private var appliedCapitalization: Bool = false
-    /// Invoked when the user taps the restart-session button on the HUD.
-    var onRestartRequested: (() -> Void)?
     /// Set once the user drags the HUD. Subsequent shows keep the dragged
     /// position instead of jumping back to the cursor.
     private var userPositioned = false
@@ -41,44 +36,16 @@ final class HUDOverlay: NSObject, NSWindowDelegate {
     private var isMovingProgrammatically = false
 
     private weak var settings: SettingsStore?
-    private var cancellables: Set<AnyCancellable> = []
 
+    /// Kept for source compatibility with the controller; the minimal HUD
+    /// has no controls bound to settings, so this is a no-op.
     func bind(settings: SettingsStore) {
         self.settings = settings
-        cancellables.removeAll()
-        // Reflect external changes (Settings window) back onto the HUD
-        // checkboxes so the two surfaces stay in sync.
-        settings.$autoPunctuation
-            .receive(on: RunLoop.main)
-            .sink { [weak self] value in
-                self?.punctuateBox?.state = value ? .on : .off
-                self?.updateRestartButtonVisibility()
-            }
-            .store(in: &cancellables)
-        settings.$autoCapitalization
-            .receive(on: RunLoop.main)
-            .sink { [weak self] value in
-                self?.capitalizeBox?.state = value ? .on : .off
-                self?.updateRestartButtonVisibility()
-            }
-            .store(in: &cancellables)
     }
 
-    /// Called by `DictationController` whenever a new Deepgram session is
-    /// established — snapshots the toggle values that just took effect so the
-    /// restart button can re-appear when they next diverge.
-    func markSettingsApplied() {
-        appliedPunctuation = settings?.autoPunctuation ?? false
-        appliedCapitalization = settings?.autoCapitalization ?? false
-        updateRestartButtonVisibility()
-    }
-
-    private func updateRestartButtonVisibility() {
-        guard let settings, let restartButton else { return }
-        let dirty = settings.autoPunctuation != appliedPunctuation
-                  || settings.autoCapitalization != appliedCapitalization
-        restartButton.isHidden = !dirty
-    }
+    /// Kept for source compatibility; nothing on the HUD needs to react to
+    /// session restarts now that the controls are gone.
+    func markSettingsApplied() {}
 
     func setAnchor(_ newAnchor: Anchor) {
         guard newAnchor != anchor else { return }
@@ -99,7 +66,25 @@ final class HUDOverlay: NSObject, NSWindowDelegate {
 
     func update(text: String) {
         guard let label else { return }
-        label.stringValue = text.isEmpty ? "Listening…" : tail(text)
+        let rendered = render(text)
+        label.stringValue = rendered
+        // Left-align while the text still fits so it grows from the leading
+        // edge; once it overflows, switch to right so the most recent words
+        // stay pinned at the trailing edge and the head ellipsis hides what
+        // slid off the left.
+        let font = label.font ?? .systemFont(ofSize: 15, weight: .medium)
+        let textWidth = (rendered as NSString).size(withAttributes: [.font: font]).width
+        label.alignment = textWidth > label.bounds.width ? .right : .left
+    }
+
+    /// Collapse newlines to ⏎ and tail-truncate so the most recent words
+    /// always fit at the right edge. Empty input shows a discreet hint.
+    private func render(_ s: String) -> String {
+        if s.isEmpty { return "Listening…" }
+        let oneLine = s
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\n", with: Self.returnGlyph)
+        return tail(oneLine)
     }
 
     /// For very long live transcripts we only want the most recent slice
@@ -119,7 +104,7 @@ final class HUDOverlay: NSObject, NSWindowDelegate {
         guard window == nil else { return }
 
         let panel = NSPanel(
-            contentRect: NSRect(x: 0, y: 0, width: 520, height: 110),
+            contentRect: NSRect(x: 0, y: 0, width: 560, height: 34),
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
             defer: false
@@ -140,92 +125,40 @@ final class HUDOverlay: NSObject, NSWindowDelegate {
         panel.delegate = self
 
         let contentRect = panel.contentView!.bounds
-        let blur = NSVisualEffectView(frame: contentRect)
-        blur.material = .hudWindow
-        blur.blendingMode = .behindWindow
-        blur.state = .active
-        blur.wantsLayer = true
-        blur.layer?.cornerRadius = 10
-        blur.layer?.masksToBounds = true
-        blur.autoresizingMask = [.width, .height]
+        let background = NSView(frame: contentRect)
+        background.wantsLayer = true
+        background.layer?.backgroundColor = NSColor.white.cgColor
+        background.layer?.cornerRadius = 8
+        background.layer?.masksToBounds = true
+        background.autoresizingMask = [.width, .height]
 
-        let lbl = NSTextField(wrappingLabelWithString: "Listening…")
-        lbl.font = .systemFont(ofSize: 13, weight: .medium)
-        lbl.textColor = .labelColor
+        let lbl = NSTextField(labelWithString: "Listening…")
+        lbl.font = .systemFont(ofSize: 15, weight: .medium)
+        lbl.textColor = .black
         lbl.alignment = .left
-        lbl.maximumNumberOfLines = 3
-        lbl.lineBreakMode = .byWordWrapping
-        // Reserve a strip at the bottom for the two checkboxes. The label
-        // sits above that strip.
-        let controlsHeight: CGFloat = 26
+        lbl.maximumNumberOfLines = 1
+        lbl.lineBreakMode = .byTruncatingHead
+        lbl.usesSingleLineMode = true
+        lbl.drawsBackground = false
+        lbl.isBezeled = false
+        lbl.isEditable = false
+        // NSTextField does not vertically center its content in a taller
+        // frame, so size the label to its single-line intrinsic height and
+        // place it on the midline manually. Width flexes with the panel;
+        // height stays fixed.
+        let labelHeight = lbl.intrinsicContentSize.height
         lbl.frame = NSRect(
             x: 14,
-            y: controlsHeight + 6,
+            y: (contentRect.height - labelHeight) / 2,
             width: contentRect.width - 28,
-            height: contentRect.height - controlsHeight - 16
+            height: labelHeight
         )
-        lbl.autoresizingMask = [.width, .height]
-        blur.addSubview(lbl)
+        lbl.autoresizingMask = [.width]
+        background.addSubview(lbl)
 
-        let punctBox = NSButton(
-            checkboxWithTitle: "Punctuation",
-            target: self,
-            action: #selector(togglePunctuation(_:))
-        )
-        punctBox.font = .systemFont(ofSize: 11)
-        punctBox.state = (settings?.autoPunctuation ?? false) ? .on : .off
-        punctBox.sizeToFit()
-        punctBox.frame.origin = NSPoint(x: 14, y: 6)
-        punctBox.autoresizingMask = [.maxXMargin, .maxYMargin]
-        blur.addSubview(punctBox)
-
-        let capsBox = NSButton(
-            checkboxWithTitle: "Capitalization",
-            target: self,
-            action: #selector(toggleCapitalization(_:))
-        )
-        capsBox.font = .systemFont(ofSize: 11)
-        capsBox.state = (settings?.autoCapitalization ?? false) ? .on : .off
-        capsBox.sizeToFit()
-        capsBox.frame.origin = NSPoint(x: punctBox.frame.maxX + 16, y: 6)
-        capsBox.autoresizingMask = [.maxXMargin, .maxYMargin]
-        blur.addSubview(capsBox)
-
-        let restartBtn = NSButton(
-            title: "↻ Restart session",
-            target: self,
-            action: #selector(restartTapped(_:))
-        )
-        restartBtn.bezelStyle = .accessoryBarAction
-        restartBtn.controlSize = .small
-        restartBtn.font = .systemFont(ofSize: 11)
-        restartBtn.sizeToFit()
-        restartBtn.frame.origin = NSPoint(
-            x: contentRect.width - restartBtn.frame.width - 14,
-            y: 4
-        )
-        restartBtn.autoresizingMask = [.minXMargin, .maxYMargin]
-        restartBtn.isHidden = true
-        blur.addSubview(restartBtn)
-
-        panel.contentView = blur
+        panel.contentView = background
         self.window = panel
         self.label = lbl
-        self.punctuateBox = punctBox
-        self.capitalizeBox = capsBox
-        self.restartButton = restartBtn
-    }
-
-    @objc private func restartTapped(_ sender: NSButton) {
-        onRestartRequested?()
-    }
-
-    @objc private func togglePunctuation(_ sender: NSButton) {
-        settings?.autoPunctuation = (sender.state == .on)
-    }
-
-    @objc private func toggleCapitalization(_ sender: NSButton) {
-        settings?.autoCapitalization = (sender.state == .on)
     }
 
     private func positionAtCursor() {

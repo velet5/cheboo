@@ -78,6 +78,7 @@ final class SettingsStore: ObservableObject {
         static let engineKind = "engineKind"
         static let whisperServerURL = "whisperServerURL"
         static let whisperServerAPIKey = "whisperServerAPIKey"
+        static let preferredInputDeviceUID = "preferredInputDeviceUID"
     }
 
     enum WhisperServerDefaults {
@@ -222,6 +223,20 @@ final class SettingsStore: ObservableObject {
         didSet { UserDefaults.standard.set(whisperServerAPIKey, forKey: Keys.whisperServerAPIKey) }
     }
 
+    /// Stable Core Audio UID of the user's chosen input device, or `nil` for
+    /// "follow the system default input". If the chosen UID isn't currently
+    /// attached, the audio engine transparently falls back to the system
+    /// default and re-binds to the preferred device the next time it appears.
+    @Published var preferredInputDeviceUID: String? {
+        didSet {
+            if let uid = preferredInputDeviceUID {
+                UserDefaults.standard.set(uid, forKey: Keys.preferredInputDeviceUID)
+            } else {
+                UserDefaults.standard.removeObject(forKey: Keys.preferredInputDeviceUID)
+            }
+        }
+    }
+
     @Published var apiKey: String {
         didSet {
             if apiKey.isEmpty {
@@ -283,6 +298,7 @@ final class SettingsStore: ObservableObject {
         self.engineKind = storedEngine ?? .deepgram
         self.whisperServerURL = defaults.string(forKey: Keys.whisperServerURL) ?? WhisperServerDefaults.url
         self.whisperServerAPIKey = defaults.string(forKey: Keys.whisperServerAPIKey) ?? ""
+        self.preferredInputDeviceUID = defaults.string(forKey: Keys.preferredInputDeviceUID)
         self.apiKey = Keychain.load() ?? ""
     }
 

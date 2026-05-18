@@ -16,6 +16,8 @@ struct MenuContent: View {
 
         Divider()
 
+        Toggle("Auto-capitalization", isOn: $settings.autoCapitalization)
+        Toggle("Auto-punctuation", isOn: $settings.autoPunctuation)
         Toggle("Subtitle mode", isOn: $settings.subtitleMode)
 
         Divider()

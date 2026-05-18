@@ -42,6 +42,7 @@ final class DictationController: ObservableObject {
 
     private var settings: SettingsStore?
     private var injectedSomething = false
+    private var cancellables: Set<AnyCancellable> = []
 
     init() {
         audio.delegate = self
@@ -49,7 +50,6 @@ final class DictationController: ObservableObject {
         hotkey.onRelease = { [weak self] in self?.handleHotkeyRelease() }
         pasteHotkey.onPress = { [weak self] in self?.flushBufferNow() }
         clearSubtitlesHotkey.onPress = { [weak self] in self?.subtitles.clear() }
-        hud.onRestartRequested = { [weak self] in self?.restartSession() }
     }
 
     /// Tear down the active dictation session and immediately open a new one
@@ -85,6 +85,17 @@ final class DictationController: ObservableObject {
         hud.bind(settings: settings)
         subtitles.bind(settings: settings)
         applyHotkey()
+
+        cancellables.removeAll()
+        // Push the user's mic choice to the audio engine at boot and any
+        // time it changes — the engine handles fallback to system default
+        // when the chosen UID isn't currently attached.
+        settings.$preferredInputDeviceUID
+            .receive(on: RunLoop.main)
+            .sink { [weak self] uid in
+                self?.audio.setPreferredInputUID(uid)
+            }
+            .store(in: &cancellables)
     }
 
     func applyHotkey() {
@@ -330,6 +341,14 @@ extension DictationController: AudioEngineDelegate {
             Log.dictation.error("audio engine failed: \(error.localizedDescription, privacy: .public)")
             self?.status = .error(error.localizedDescription)
             self?.stop()
+        }
+    }
+
+    func audioEngineWantsRestartForDeviceChange(_ engine: AudioEngine) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.isRecording else { return }
+            Log.dictation.info("restarting dictation session to switch input devices")
+            self.restartSession()
         }
     }
 }

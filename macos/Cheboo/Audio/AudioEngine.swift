@@ -1,9 +1,20 @@
 import AVFoundation
+import CoreAudio
 import Foundation
 
 protocol AudioEngineDelegate: AnyObject {
     func audioEngine(_ engine: AudioEngine, didCapture pcm: Data)
     func audioEngine(_ engine: AudioEngine, didFailWith error: Error)
+    /// Fired when the live device list changed and the engine *would* now
+    /// resolve to a different input device than the one it's currently
+    /// recording from. Caller decides whether to seamlessly restart the
+    /// session so the new device (typically: the user's chosen mic that just
+    /// came back online) takes effect.
+    func audioEngineWantsRestartForDeviceChange(_ engine: AudioEngine)
+}
+
+extension AudioEngineDelegate {
+    func audioEngineWantsRestartForDeviceChange(_ engine: AudioEngine) {}
 }
 
 /// Captures mic audio and converts to 16 kHz mono Int16 PCM frames suitable for
@@ -34,6 +45,22 @@ final class AudioEngine {
     private var isRunning = false
     private var configChangeObserver: NSObjectProtocol?
 
+    /// User's preferred input device, by Core Audio UID. `nil` means "follow
+    /// the system default input." When the preferred UID isn't currently
+    /// attached we transparently fall back to the default; the device-list
+    /// listener picks up reconnects and prompts the delegate to restart.
+    private var preferredInputUID: String?
+    /// `AudioDeviceID` we last set on the input AU, so the device-list
+    /// listener can decide whether a change in available devices actually
+    /// warrants a restart.
+    private var activeInputDeviceID: AudioDeviceID = 0
+    private var deviceListenerBlock: AudioObjectPropertyListenerBlock?
+    private var deviceListenerAddress = AudioObjectPropertyAddress(
+        mSelector: kAudioHardwarePropertyDevices,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain
+    )
+
     init() {
         targetFormat = AVAudioFormat(
             commonFormat: .pcmFormatInt16,
@@ -42,11 +69,36 @@ final class AudioEngine {
             interleaved: true
         )!
         observeConfigChanges()
+        observeDeviceList()
     }
 
     deinit {
         if let configChangeObserver {
             NotificationCenter.default.removeObserver(configChangeObserver)
+        }
+        if let block = deviceListenerBlock {
+            AudioObjectRemovePropertyListenerBlock(
+                AudioObjectID(kAudioObjectSystemObject),
+                &deviceListenerAddress,
+                DispatchQueue.main,
+                block
+            )
+        }
+    }
+
+    /// Update the preferred input device. Safe to call any time. If we're
+    /// recording and the new preference resolves to a different device, we
+    /// signal the delegate to restart so the choice takes effect.
+    func setPreferredInputUID(_ uid: String?) {
+        let same = (uid ?? "") == (preferredInputUID ?? "")
+        preferredInputUID = uid
+        guard !same, isRunning else { return }
+        let target = resolveTargetDeviceID()
+        if target != activeInputDeviceID {
+            callbackQueue.async { [weak self] in
+                guard let self else { return }
+                self.delegate?.audioEngineWantsRestartForDeviceChange(self)
+            }
         }
     }
 
@@ -67,6 +119,11 @@ final class AudioEngine {
     // MARK: - Engine bring-up
 
     private func startEngine(retrying: Bool = false) throws {
+        // Pick the input device before we read formats — the input node's
+        // `outputFormat(forBus:)` reports the *current* device's format, and
+        // we'd otherwise install a tap against the wrong device.
+        applyPreferredDevice()
+
         let input = engine.inputNode
         let inputFormat = input.outputFormat(forBus: 0)
 
@@ -126,6 +183,80 @@ final class AudioEngine {
         }
         isRunning = true
         Log.audio.info("audio engine started")
+    }
+
+    // MARK: - Input device selection
+
+    /// Resolve `preferredInputUID` against the live device list. Falls back
+    /// to the system default input. Returns 0 if neither is available.
+    private func resolveTargetDeviceID() -> AudioDeviceID {
+        if let uid = preferredInputUID, !uid.isEmpty,
+           let id = InputDevices.deviceID(forUID: uid) {
+            return id
+        }
+        return InputDevices.defaultInputDeviceID() ?? 0
+    }
+
+    /// Set the chosen device on the input node's underlying AUHAL audio
+    /// unit. `kAudioOutputUnitProperty_CurrentDevice` is the documented
+    /// channel for binding the macOS input node to a specific HAL device;
+    /// AVAudioEngine respects the value as long as it's set before
+    /// `prepare()` / `start()`. Leaves `activeInputDeviceID` set to whatever
+    /// the unit actually ended up on so the listener can detect drift.
+    private func applyPreferredDevice() {
+        let target = resolveTargetDeviceID()
+        guard target != 0, let inputUnit = engine.inputNode.audioUnit else {
+            // Couldn't pick anything — leave the engine on its default and
+            // record what that is so we don't false-fire on the next change.
+            activeInputDeviceID = InputDevices.defaultInputDeviceID() ?? 0
+            return
+        }
+        var deviceID = target
+        let propSize = UInt32(MemoryLayout<AudioDeviceID>.size)
+        let status = AudioUnitSetProperty(
+            inputUnit,
+            kAudioOutputUnitProperty_CurrentDevice,
+            kAudioUnitScope_Global,
+            0,
+            &deviceID,
+            propSize
+        )
+        if status != noErr {
+            Log.audio.error("failed to bind input device \(target, privacy: .public) (status=\(status, privacy: .public))")
+            activeInputDeviceID = InputDevices.defaultInputDeviceID() ?? 0
+        } else {
+            activeInputDeviceID = target
+            Log.audio.info("bound input device id=\(target, privacy: .public) uid=\(self.preferredInputUID ?? "(default)", privacy: .public)")
+        }
+    }
+
+    private func observeDeviceList() {
+        let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+            self?.handleDeviceListChange()
+        }
+        deviceListenerBlock = block
+        let status = AudioObjectAddPropertyListenerBlock(
+            AudioObjectID(kAudioObjectSystemObject),
+            &deviceListenerAddress,
+            DispatchQueue.main,
+            block
+        )
+        if status != noErr {
+            Log.audio.error("AudioEngine: failed to add device-list listener (\(status, privacy: .public))")
+        }
+    }
+
+    private func handleDeviceListChange() {
+        // The user's preferred mic may have just been (un)plugged. If we're
+        // idle, the next start() will pick the right device on its own.
+        guard isRunning else { return }
+        let target = resolveTargetDeviceID()
+        guard target != activeInputDeviceID else { return }
+        Log.audio.notice("device list changed — preferred device now resolves to a different id; requesting restart")
+        callbackQueue.async { [weak self] in
+            guard let self else { return }
+            self.delegate?.audioEngineWantsRestartForDeviceChange(self)
+        }
     }
 
     // MARK: - Configuration change
