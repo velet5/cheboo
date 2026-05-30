@@ -34,6 +34,7 @@ enum HUDPosition: String, CaseIterable, Identifiable {
 enum TranscriptionEngineKind: String, CaseIterable, Identifiable {
     case deepgram
     case whisperServer
+    case whisperLocal
 
     var id: String { rawValue }
 
@@ -41,6 +42,28 @@ enum TranscriptionEngineKind: String, CaseIterable, Identifiable {
         switch self {
         case .deepgram: return "Deepgram (cloud, streaming)"
         case .whisperServer: return "Whisper API (OpenAI-compatible, batch)"
+        case .whisperLocal: return "Whisper (on-device, Core ML)"
+        }
+    }
+}
+
+/// On-device Whisper model variants offered for the `whisperLocal` engine. The
+/// raw value is the WhisperKit / `argmaxinc/whisperkit-coreml` model folder
+/// name passed straight through to `WhisperKit`.
+enum WhisperKitModel: String, CaseIterable, Identifiable {
+    case tiny = "openai_whisper-tiny"
+    case base = "openai_whisper-base"
+    case small = "openai_whisper-small"
+    case turbo = "openai_whisper-large-v3-v20240930_turbo_632MB"
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .tiny: return "Tiny — fastest, lowest accuracy (~75 MB)"
+        case .base: return "Base — fast, good for dictation (~145 MB)"
+        case .small: return "Small — slower, more accurate (~480 MB)"
+        case .turbo: return "Large v3 Turbo — most accurate (~630 MB)"
         }
     }
 }
@@ -78,7 +101,10 @@ final class SettingsStore: ObservableObject {
         static let engineKind = "engineKind"
         static let whisperServerURL = "whisperServerURL"
         static let whisperServerAPIKey = "whisperServerAPIKey"
+        static let whisperKitModel = "whisperKitModel"
+        static let whisperKitStreaming = "whisperKitStreaming"
         static let preferredInputDeviceUID = "preferredInputDeviceUID"
+        static let datasetCollectionEnabled = "datasetCollectionEnabled"
     }
 
     enum WhisperServerDefaults {
@@ -109,8 +135,10 @@ final class SettingsStore: ObservableObject {
         didSet { Self.persistKeytermLists(keytermLists) }
     }
 
-    /// `nil` means "don't send any keyterms" — Deepgram stays on its cheaper
-    /// per-minute tier when no `keyterm=` params are on the URL.
+    /// The list to fall back to when the frontmost app doesn't match any
+    /// list's `bundleIDs` rules. `nil` means "no fallback" — when no rule
+    /// matches, Deepgram is connected with zero keyterms (cheaper per-minute
+    /// tier). Per-app lists override this regardless of selection.
     @Published var selectedKeytermListID: UUID? {
         didSet {
             if let id = selectedKeytermListID {
@@ -223,6 +251,19 @@ final class SettingsStore: ObservableObject {
         didSet { UserDefaults.standard.set(whisperServerAPIKey, forKey: Keys.whisperServerAPIKey) }
     }
 
+    /// WhisperKit model variant for the on-device `whisperLocal` engine. Stored
+    /// as the raw `WhisperKitModel` value (the model folder name).
+    @Published var whisperKitModel: String {
+        didSet { UserDefaults.standard.set(whisperKitModel, forKey: Keys.whisperKitModel) }
+    }
+
+    /// On-device Whisper recognition mode. When true (default), the engine shows
+    /// live interim text by re-transcribing the growing buffer while you speak.
+    /// When false it runs a single pass on release (lower compute, no live text).
+    @Published var whisperKitStreaming: Bool {
+        didSet { UserDefaults.standard.set(whisperKitStreaming, forKey: Keys.whisperKitStreaming) }
+    }
+
     /// Stable Core Audio UID of the user's chosen input device, or `nil` for
     /// "follow the system default input". If the chosen UID isn't currently
     /// attached, the audio engine transparently falls back to the system
@@ -235,6 +276,15 @@ final class SettingsStore: ObservableObject {
                 UserDefaults.standard.removeObject(forKey: Keys.preferredInputDeviceUID)
             }
         }
+    }
+
+    /// When true, each dictation session writes its 16 kHz mono Int16 PCM
+    /// audio plus the recognizer's transcript (with word timestamps when the
+    /// engine surfaces them) to `~/Library/Application Support/Cheboo/Dataset`,
+    /// for use as a personal corpus for fine-tuning speech models. Off by
+    /// default — Cheboo otherwise keeps no audio on disk.
+    @Published var datasetCollectionEnabled: Bool {
+        didSet { UserDefaults.standard.set(datasetCollectionEnabled, forKey: Keys.datasetCollectionEnabled) }
     }
 
     @Published var apiKey: String {
@@ -255,6 +305,22 @@ final class SettingsStore: ObservableObject {
               let list = keytermLists.first(where: { $0.id == id })
         else { return [] }
         return list.terms
+    }
+
+    /// Resolve which list applies given the currently focused app's bundle
+    /// id. First list (in user-visible order) whose `bundleIDs` contains the
+    /// id wins; if nothing matches, falls back to `activeKeyterms`. An empty
+    /// or nil bundle id skips the rule lookup entirely.
+    func keyterms(forBundleID bundleID: String?) -> (terms: [String], listName: String?) {
+        if let bundleID, !bundleID.isEmpty,
+           let match = keytermLists.first(where: { $0.bundleIDs.contains(bundleID) }) {
+            return (match.terms, match.name)
+        }
+        if let id = selectedKeytermListID,
+           let list = keytermLists.first(where: { $0.id == id }) {
+            return (list.terms, list.name)
+        }
+        return ([], nil)
     }
 
     init() {
@@ -298,7 +364,10 @@ final class SettingsStore: ObservableObject {
         self.engineKind = storedEngine ?? .deepgram
         self.whisperServerURL = defaults.string(forKey: Keys.whisperServerURL) ?? WhisperServerDefaults.url
         self.whisperServerAPIKey = defaults.string(forKey: Keys.whisperServerAPIKey) ?? ""
+        self.whisperKitModel = defaults.string(forKey: Keys.whisperKitModel) ?? WhisperKitModel.base.rawValue
+        self.whisperKitStreaming = defaults.object(forKey: Keys.whisperKitStreaming) as? Bool ?? true
         self.preferredInputDeviceUID = defaults.string(forKey: Keys.preferredInputDeviceUID)
+        self.datasetCollectionEnabled = defaults.object(forKey: Keys.datasetCollectionEnabled) as? Bool ?? false
         self.apiKey = Keychain.load() ?? ""
     }
 

@@ -8,11 +8,30 @@ struct KeytermList: Codable, Identifiable, Equatable {
     var id: UUID
     var name: String
     var terms: [String]
+    /// Bundle identifiers of apps that should auto-select this list when one
+    /// of them is the frontmost application at dictation start. Resolution
+    /// scans `keytermLists` in order — the first list whose `bundleIDs`
+    /// contains the focused app's id wins. Empty means "no app rules" —
+    /// only reachable via the default-list fallback.
+    var bundleIDs: [String]
 
-    init(id: UUID = UUID(), name: String, terms: [String]) {
+    init(id: UUID = UUID(), name: String, terms: [String], bundleIDs: [String] = []) {
         self.id = id
         self.name = name
         self.terms = terms
+        self.bundleIDs = bundleIDs
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, name, terms, bundleIDs
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(UUID.self, forKey: .id)
+        name = try c.decode(String.self, forKey: .name)
+        terms = try c.decode([String].self, forKey: .terms)
+        bundleIDs = try c.decodeIfPresent([String].self, forKey: .bundleIDs) ?? []
     }
 }
 

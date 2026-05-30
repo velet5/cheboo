@@ -15,6 +15,11 @@ settings:
     ENABLE_HARDENED_RUNTIME: YES
     GENERATE_INFOPLIST_FILE: NO
 
+packages:
+  WhisperKit:
+    url: https://github.com/argmaxinc/argmax-oss-swift.git
+    branch: main
+
 targets:
   Cheboo:
     type: application
@@ -23,6 +28,9 @@ targets:
       - path: Cheboo
         excludes:
           - "**/.DS_Store"
+    dependencies:
+      - package: WhisperKit
+        product: WhisperKit
     info:
       path: Cheboo/Info.plist
       properties:

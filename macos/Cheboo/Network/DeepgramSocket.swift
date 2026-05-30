@@ -155,10 +155,19 @@ final class DeepgramSocket: NSObject, TranscriptionEngine {
         else { return }
 
         if response.isFinal == true {
+            let words: [TranscriptWord] = response.firstWords.map {
+                TranscriptWord(
+                    text: $0.punctuatedWord ?? $0.word,
+                    start: $0.start,
+                    end: $0.end,
+                    confidence: $0.confidence
+                )
+            }
             delegate?.engine(
                 self,
                 didReceiveFinal: transcript,
-                speechFinal: response.speechFinal ?? false
+                speechFinal: response.speechFinal ?? false,
+                words: words
             )
         } else {
             delegate?.engine(self, didReceiveInterim: transcript)

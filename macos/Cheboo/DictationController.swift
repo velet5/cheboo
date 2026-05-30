@@ -31,6 +31,10 @@ final class DictationController: ObservableObject {
     @Published private(set) var interimText = ""
     @Published private(set) var isRecording = false
 
+    /// Shown in the HUD while a batch engine (Whisper) runs its post-stop pass,
+    /// so the screen isn't blank during a multi-second wait.
+    private static let transcribingPlaceholder = "Transcribing…"
+
     private let audio = AudioEngine()
     private let injector = TextInjector()
     private let hud = HUDOverlay()
@@ -40,8 +44,15 @@ final class DictationController: ObservableObject {
     private let clearSubtitlesHotkey = HotkeyManager(id: 3)
     private var engine: TranscriptionEngine?
 
+    /// Personal speech corpus. Exposed so SwiftUI can observe `stats` directly
+    /// for the Dataset settings tab.
+    let dataset = DatasetRecorder()
+
     private var settings: SettingsStore?
     private var injectedSomething = false
+    /// Snapshot of `settings.datasetCollectionEnabled` taken at session start
+    /// — toggling the setting mid-session shouldn't half-record the utterance.
+    private var datasetActiveForCurrentSession = false
     private var cancellables: Set<AnyCancellable> = []
 
     init() {
@@ -161,13 +172,23 @@ final class DictationController: ObservableObject {
                 status = .error("Set a Deepgram API key in Settings.")
                 return
             }
+            // Skip our own bundle id — if Cheboo's Settings window happens to
+            // be frontmost when the hotkey fires, fall through to the default
+            // list rather than matching a rule the user accidentally added.
+            let ownBundleID = Bundle.main.bundleIdentifier
+            let frontmost = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
+            let focusedBundleID = (frontmost != ownBundleID) ? frontmost : nil
+            let resolved = settings.keyterms(forBundleID: focusedBundleID)
+            Log.dictation.info(
+                "keyterms resolved — app=\(focusedBundleID ?? "nil", privacy: .public) list=\(resolved.listName ?? "—", privacy: .public) count=\(resolved.terms.count)"
+            )
             newEngine = DeepgramSocket(
                 apiKey: settings.apiKey,
                 model: language.deepgramModel,
                 language: language.deepgramLanguage,
                 punctuate: settings.autoPunctuation,
                 smartFormat: settings.autoCapitalization,
-                keyterms: settings.activeKeyterms
+                keyterms: resolved.terms
             )
         case .whisperServer:
             guard !settings.whisperServerURL.isEmpty else {
@@ -179,6 +200,12 @@ final class DictationController: ObservableObject {
                 apiKey: settings.whisperServerAPIKey,
                 language: language.whisperLanguage
             )
+        case .whisperLocal:
+            newEngine = WhisperKitEngine(
+                modelName: settings.whisperKitModel,
+                language: language.whisperLanguage,
+                streaming: settings.whisperKitStreaming
+            )
         }
 
         injectedSomething = false
@@ -188,6 +215,30 @@ final class DictationController: ObservableObject {
         newEngine.delegate = self
         newEngine.start()
         self.engine = newEngine
+
+        datasetActiveForCurrentSession = settings.datasetCollectionEnabled
+        if datasetActiveForCurrentSession {
+            // Label the recorded session with the engine actually in use, so the
+            // corpus metadata is accurate regardless of which backend ran.
+            let datasetLanguage: String
+            let datasetModel: String
+            switch settings.engineKind {
+            case .deepgram:
+                datasetLanguage = language.deepgramLanguage
+                datasetModel = language.deepgramModel
+            case .whisperServer:
+                datasetLanguage = language.whisperLanguage
+                datasetModel = "whisper-1"
+            case .whisperLocal:
+                datasetLanguage = language.whisperLanguage
+                datasetModel = settings.whisperKitModel
+            }
+            dataset.beginSession(
+                engine: settings.engineKind.rawValue,
+                language: datasetLanguage,
+                model: datasetModel
+            )
+        }
 
         do {
             try audio.start()
@@ -205,6 +256,7 @@ final class DictationController: ObservableObject {
             status = .error(error.localizedDescription)
             newEngine.stop()
             self.engine = nil
+            cancelDatasetIfActive()
         }
     }
 
@@ -213,6 +265,7 @@ final class DictationController: ObservableObject {
             // If we were mid-connect, tear it down anyway.
             engine?.stop()
             engine = nil
+            cancelDatasetIfActive()
             return
         }
         Log.dictation.info("stop requested")
@@ -221,30 +274,70 @@ final class DictationController: ObservableObject {
         let flushed = interimText
         interimText = ""
         status = .idle
-        hud.hide()
+
+        // Batch engines (Whisper server / on-device) deliver their authoritative
+        // transcript as a single final *after* stop(); any interim shown while
+        // recording is a lower-quality preview that's missing the last fraction
+        // of a second of speech. We must wait for that final rather than
+        // committing the interim. Streaming engines (Deepgram) finalize
+        // incrementally, so by now the only un-typed text is the dangling
+        // interim.
+        let waitForFinal = engine?.finalizesAfterStop ?? false
+
         // Subtitle mode persists what was said until the user explicitly
         // clears it with the clear-subtitles hotkey, so we don't hide here.
-        // Any interim that hadn't yet been finalized gets committed so the
-        // visible text matches what was typed.
-        if settings?.subtitleMode == true, !flushed.isEmpty {
+        // For streaming engines, commit the dangling interim so the visible
+        // text matches what was typed; for batch engines the post-stop final
+        // supersedes the interim, so let didReceiveFinal commit it instead.
+        if settings?.subtitleMode == true, !flushed.isEmpty, !waitForFinal {
             subtitles.commit(text: flushed)
         }
 
-        if !flushed.isEmpty {
-            // We already see the transcript on screen — type it and detach
-            // the engine so its post-stop final can't double-type.
+        if !flushed.isEmpty, !waitForFinal {
+            // Streaming engine: we already see the transcript on screen — type
+            // it and detach the engine so its post-stop final can't double-type.
+            hud.hide()
             engine?.delegate = nil
             engine?.stop()
             engine = nil
             injector.type(formatChunk(flushed))
             injectedSomething = true
         } else {
-            // Nothing on screen yet (no interim received). Stop the engine
-            // but leave the delegate attached briefly so any post-stop final
-            // still injects through the normal path. No HUD spinner — the
-            // user moves on and the late text just appears.
+            // Either nothing on screen yet, or a batch engine whose final is
+            // still pending. Keep the delegate attached so the post-stop final
+            // injects through didReceiveFinal. For batch engines show a
+            // transcribing indicator so the wait isn't a blank screen.
+            if waitForFinal, settings?.showHUD == true {
+                hud.show(text: Self.transcribingPlaceholder)
+            } else {
+                hud.hide()
+            }
             engine?.stop()
         }
+
+        // Deepgram has already appended every final to the dataset during
+        // recording, so finalize now. Batch engines deliver their final after
+        // stop() — defer their dataset finalize to didReceiveFinal/didCloseWith
+        // so the transcript isn't dropped (the session would otherwise close
+        // before the transcript arrives).
+        if !waitForFinal {
+            finalizeDatasetIfActive()
+        }
+    }
+
+    /// Persist the in-progress dataset session, if one is open. Idempotent —
+    /// safe to call from whichever of stop()/didReceiveFinal/didCloseWith wins.
+    private func finalizeDatasetIfActive() {
+        guard datasetActiveForCurrentSession else { return }
+        dataset.finalizeSession()
+        datasetActiveForCurrentSession = false
+    }
+
+    /// Drop the in-progress dataset session without writing it.
+    private func cancelDatasetIfActive() {
+        guard datasetActiveForCurrentSession else { return }
+        dataset.cancelSession()
+        datasetActiveForCurrentSession = false
     }
 
     // MARK: Injection formatting
@@ -334,12 +427,18 @@ extension DictationController: AudioEngineDelegate {
     func audioEngine(_ engine: AudioEngine, didCapture pcm: Data) {
         // Called from AudioEngine.callbackQueue; engine.send is thread-safe.
         self.engine?.send(pcm)
+        // DatasetRecorder serializes appends on its own queue; a no-op when
+        // no session is open, so it's safe to call unconditionally.
+        dataset.appendPCM(pcm)
     }
 
     func audioEngine(_ engine: AudioEngine, didFailWith error: Error) {
         DispatchQueue.main.async { [weak self] in
             Log.dictation.error("audio engine failed: \(error.localizedDescription, privacy: .public)")
             self?.status = .error(error.localizedDescription)
+            // Drop any audio captured during the doomed session — we don't
+            // want half-utterances landing in the training corpus.
+            self?.cancelDatasetIfActive()
             self?.stop()
         }
     }
@@ -377,11 +476,20 @@ extension DictationController: TranscriptionEngineDelegate {
         }
     }
 
-    func engine(_ engine: TranscriptionEngine, didReceiveFinal text: String, speechFinal: Bool) {
+    func engine(_ engine: TranscriptionEngine, didReceiveFinal text: String, speechFinal: Bool, words: [TranscriptWord]) {
         DispatchQueue.main.async { [weak self] in
             guard let self, let settings = self.settings else { return }
 
             let processed = Self.substituteCommands(text)
+
+            // Store the recognizer's original (pre-command-substitution) text
+            // alongside the audio — that's what the model actually produced,
+            // and what we'd train against. Word timestamps come from Deepgram
+            // and on-device WhisperKit; the HTTP Whisper server passes an empty
+            // array.
+            if self.datasetActiveForCurrentSession {
+                self.dataset.appendFinal(text: text, speechFinal: speechFinal, words: words)
+            }
 
             // Subtitle accumulation is independent of injection — we always
             // commit finals into the on-screen buffer when subtitle mode is
@@ -406,6 +514,10 @@ extension DictationController: TranscriptionEngineDelegate {
                 self.engine?.delegate = nil
                 self.engine?.stop()
                 self.engine = nil
+                // Clear the transcribing indicator and persist the dataset
+                // session now that the final (with word timestamps) has landed.
+                self.hud.hide()
+                self.finalizeDatasetIfActive()
             } else if settings.showHUD {
                 self.hud.update(text: "")
             }
@@ -416,11 +528,29 @@ extension DictationController: TranscriptionEngineDelegate {
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             self.engine = nil
-            if let error, self.isRecording {
-                Log.dictation.error("engine closed with error: \(error.localizedDescription, privacy: .public)")
-                self.status = .error(error.localizedDescription)
+            // Always clear any transcribing indicator — whether the engine
+            // produced a final, nothing, or an error.
+            self.hud.hide()
+
+            guard let error else {
+                // Clean close. A batch engine that emitted no final (empty
+                // transcript) still has an open dataset session; settle it here.
+                self.finalizeDatasetIfActive()
+                return
+            }
+
+            Log.dictation.error("engine closed with error: \(error.localizedDescription, privacy: .public)")
+            // The session is gone; drop any half-recorded dataset audio rather
+            // than pairing it with a transcript that never arrived.
+            self.cancelDatasetIfActive()
+            if self.isRecording {
                 self.stop()
             }
+            // Set after stop() so its `status = .idle` can't clobber the error.
+            // Crucially this also surfaces *post-stop* failures (e.g. an
+            // unreachable Whisper server), which happen when isRecording is
+            // already false and would otherwise be swallowed silently.
+            self.status = .error(error.localizedDescription)
         }
     }
 }

@@ -17,6 +17,9 @@ import Foundation
 final class WhisperServerEngine: TranscriptionEngine {
     weak var delegate: TranscriptionEngineDelegate?
 
+    /// Batch: the only transcript arrives after `stop()`.
+    let finalizesAfterStop = true
+
     private let baseURL: String
     private let apiKey: String
     private let language: String
@@ -165,7 +168,7 @@ final class WhisperServerEngine: TranscriptionEngine {
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             if !trimmed.isEmpty {
-                self.delegate?.engine(self, didReceiveFinal: trimmed, speechFinal: true)
+                self.delegate?.engine(self, didReceiveFinal: trimmed, speechFinal: true, words: [])
             }
             self.delegate?.engine(self, didCloseWith: nil)
         }
@@ -190,9 +193,13 @@ final class WhisperServerEngine: TranscriptionEngine {
     /// that don't follow the JSON contract.
     private static func parseTranscript(_ data: Data) -> String {
         struct Body: Decodable { let text: String? }
-        if let body = try? JSONDecoder().decode(Body.self, from: data), let text = body.text {
-            return text
+        // A well-formed JSON body wins even when `text` is null/absent — return
+        // the (possibly empty) string rather than falling through and typing the
+        // raw `{"text":null}` JSON as if it were a transcript.
+        if let body = try? JSONDecoder().decode(Body.self, from: data) {
+            return body.text ?? ""
         }
+        // Plain-text servers (response_format=text) don't return JSON at all.
         return String(data: data, encoding: .utf8) ?? ""
     }
 

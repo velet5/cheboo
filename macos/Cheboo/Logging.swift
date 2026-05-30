@@ -13,4 +13,5 @@ enum Log {
     static let socket = Logger(subsystem: subsystem, category: "socket")
     static let whisper = Logger(subsystem: subsystem, category: "whisper")
     static let settings = Logger(subsystem: subsystem, category: "settings")
+    static let dataset = Logger(subsystem: subsystem, category: "dataset")
 }

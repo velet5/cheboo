@@ -6,15 +6,24 @@ struct SettingsView: View {
     @EnvironmentObject private var settings: SettingsStore
     @EnvironmentObject private var dictation: DictationController
     @StateObject private var inputDevices = InputDeviceMonitor.shared
+    @ObservedObject private var whisperModels = WhisperKitModelManager.shared
 
     var body: some View {
         TabView {
             generalTab.tabItem { Label("General", systemImage: "gearshape") }
             engineTab.tabItem { Label("Engine", systemImage: "cpu") }
             keytermsTab.tabItem { Label("Keyterms", systemImage: "text.book.closed") }
+            datasetTab.tabItem { Label("Dataset", systemImage: "waveform") }
             permissionsTab.tabItem { Label("Permissions", systemImage: "lock.shield") }
         }
         .padding(20)
+    }
+
+    // MARK: Dataset
+
+    private var datasetTab: some View {
+        DatasetSettingsView(recorder: dictation.dataset)
+            .environmentObject(settings)
     }
 
     // MARK: Engine
@@ -53,8 +62,73 @@ struct SettingsView: View {
                         .foregroundStyle(.secondary)
                 }
             }
+
+            if settings.engineKind == .whisperLocal {
+                Section("Whisper (on-device)") {
+                    Picker("Model", selection: $settings.whisperKitModel) {
+                        ForEach(WhisperKitModel.allCases) { model in
+                            Text(model.label).tag(model.rawValue)
+                        }
+                    }
+                    Picker("Recognition", selection: $settings.whisperKitStreaming) {
+                        Text("Streaming (live interim text)").tag(true)
+                        Text("One-pass (on release)").tag(false)
+                    }
+                    Text(settings.whisperKitStreaming
+                        ? "Re-transcribes while you speak so text appears live. Uses more compute."
+                        : "Transcribes once when you release the hotkey. Lower compute, no live text.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    HStack {
+                        Text(whisperModelStatus)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                        Button(whisperModelBusy ? "Working…" : "Download / load") {
+                            WhisperKitModelManager.shared.prewarm(modelName: settings.whisperKitModel)
+                        }
+                        .disabled(whisperModelBusy)
+                    }
+                    Text("Runs Whisper entirely on-device via Core ML on Apple Silicon — no network or API key. The selected model downloads once on first use and is cached locally.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
         }
         .formStyle(.grouped)
+    }
+
+    /// Human-readable status for the on-device model, driven by the shared
+    /// `WhisperKitModelManager` so the user can pre-download before dictating.
+    private var whisperModelStatus: String {
+        switch whisperModels.state {
+        case .idle:
+            return "Not loaded yet — downloads on first dictation."
+        case .downloading(let fraction):
+            return "Downloading… \(Int(fraction * 100))%"
+        case .loading:
+            return "Loading model…"
+        case .ready(let model):
+            // The manager caches one model at a time. If the user has since
+            // picked a different one, the cached model no longer matches the
+            // selection — report it as not-yet-loaded so the status doesn't
+            // falsely claim the selected model is ready.
+            guard model == settings.whisperKitModel else {
+                return "Not loaded yet — downloads on first dictation."
+            }
+            return "Ready: \(model)"
+        case .failed(let message):
+            return "Failed: \(message)"
+        }
+    }
+
+    /// True while the shared manager is actively fetching or loading a model, so
+    /// the Download button can be disabled to avoid stacking redundant loads.
+    private var whisperModelBusy: Bool {
+        switch whisperModels.state {
+        case .downloading, .loading: return true
+        default: return false
+        }
     }
 
     private var engineHint: String {
@@ -63,6 +137,8 @@ struct SettingsView: View {
             return "Streams audio to Deepgram and shows interim text while you speak. Requires an API key (below) and a network connection."
         case .whisperServer:
             return "POSTs the full utterance to an OpenAI-compatible Whisper endpoint when you release the hotkey. No live interim text. Works against a local whisper.cpp server or OpenAI cloud."
+        case .whisperLocal:
+            return "Transcribes entirely on-device with Core ML on Apple Silicon — no network or API key. Streams live interim text or runs a single pass on release (see Recognition below). The selected model downloads once on first use."
         }
     }
 
@@ -337,22 +413,24 @@ struct SettingsView: View {
     // MARK: Keyterms
 
     @State private var newTerm: String = ""
+    @State private var newBundleID: String = ""
     @State private var editingListID: UUID?
     @State private var editingListName: String = ""
 
     private var keytermsTab: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("Keyterms bias Deepgram toward project- and shell-specific vocabulary. Keep separate lists per project; pick one (or none) to send at connect time. Up to 100 terms per list are sent.")
+            Text("Keyterms bias Deepgram toward project- and shell-specific vocabulary. Assign apps to a list to auto-switch when that app is focused at dictation start; otherwise the default list below is used. Up to 100 terms per list are sent.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
 
             HStack(spacing: 8) {
-                Picker("Active list", selection: activeListBinding) {
-                    Text("— None (no keyterms) —").tag(UUID?.none)
+                Picker("Default list", selection: activeListBinding) {
+                    Text("— None (no fallback) —").tag(UUID?.none)
                     ForEach(settings.keytermLists) { list in
                         Text(list.name).tag(UUID?.some(list.id))
                     }
                 }
+                .help("Used when the focused app doesn't match any list's app rules.")
                 Button {
                     let new = KeytermList(name: uniqueListName("New list"), terms: [])
                     settings.keytermLists.append(new)
@@ -368,7 +446,7 @@ struct SettingsView: View {
                let list = settings.keytermLists.first(where: { $0.id == activeID }) {
                 activeListEditor(list)
             } else {
-                Text("No list selected — Cheboo won't send any keyterms when dictating. Pick a list above to edit it, or create a new one.")
+                Text("No default list selected. Cheboo will only send keyterms when the focused app matches a list's app rules. Pick a list above to set a default, or create a new one.")
                     .font(.callout)
                     .foregroundStyle(.secondary)
                     .padding(.top, 8)
@@ -432,6 +510,8 @@ struct SettingsView: View {
                 }
             }
 
+            appRulesEditor(for: list)
+
             HStack {
                 TextField("Add term…", text: $newTerm)
                     .textFieldStyle(.roundedBorder)
@@ -464,6 +544,124 @@ struct SettingsView: View {
             }
             .frame(minHeight: 240)
         }
+    }
+
+    // MARK: App rules (per-list)
+
+    @ViewBuilder
+    private func appRulesEditor(for list: KeytermList) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                Text("Apply automatically to")
+                    .font(.subheadline.weight(.semibold))
+                Spacer()
+                Menu {
+                    let assigned = Set(list.bundleIDs)
+                    let candidates = Self.runningRegularApps().filter { !assigned.contains($0.bundleID) }
+                    if candidates.isEmpty {
+                        Text("No other running apps")
+                    } else {
+                        ForEach(candidates, id: \.bundleID) { app in
+                            Button(app.name) { addBundleID(app.bundleID, to: list.id) }
+                        }
+                    }
+                } label: {
+                    Label("Add running app", systemImage: "plus")
+                }
+                .fixedSize()
+            }
+
+            if list.bundleIDs.isEmpty {
+                Text("No apps assigned. This list is only used when picked as the default.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            } else {
+                VStack(alignment: .leading, spacing: 2) {
+                    ForEach(list.bundleIDs, id: \.self) { bid in
+                        let ref = Self.appRef(forBundleID: bid)
+                        HStack(spacing: 6) {
+                            if let icon = ref.icon {
+                                Image(nsImage: icon)
+                                    .resizable()
+                                    .frame(width: 16, height: 16)
+                            } else {
+                                Image(systemName: "app.dashed")
+                                    .frame(width: 16, height: 16)
+                                    .foregroundStyle(.secondary)
+                            }
+                            Text(ref.name)
+                            Text(bid)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            Spacer()
+                            Button {
+                                removeBundleID(bid, from: list.id)
+                            } label: { Image(systemName: "minus.circle") }
+                            .buttonStyle(.borderless)
+                        }
+                    }
+                }
+            }
+
+            HStack {
+                TextField("Bundle ID (e.g. com.mitchellh.ghostty)", text: $newBundleID)
+                    .textFieldStyle(.roundedBorder)
+                    .onSubmit { commitCustomBundleID(to: list.id) }
+                Button("Add") { commitCustomBundleID(to: list.id) }
+                    .disabled(newBundleID.trimmingCharacters(in: .whitespaces).isEmpty)
+            }
+        }
+        .padding(8)
+        .background(
+            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                .fill(Color.secondary.opacity(0.08))
+        )
+    }
+
+    private func addBundleID(_ id: String, to listID: UUID) {
+        guard let idx = settings.keytermLists.firstIndex(where: { $0.id == listID }) else { return }
+        if !settings.keytermLists[idx].bundleIDs.contains(id) {
+            settings.keytermLists[idx].bundleIDs.append(id)
+        }
+    }
+
+    private func removeBundleID(_ id: String, from listID: UUID) {
+        guard let idx = settings.keytermLists.firstIndex(where: { $0.id == listID }) else { return }
+        settings.keytermLists[idx].bundleIDs.removeAll { $0 == id }
+    }
+
+    private func commitCustomBundleID(to listID: UUID) {
+        let trimmed = newBundleID.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty else { return }
+        addBundleID(trimmed, to: listID)
+        newBundleID = ""
+    }
+
+    private static func runningRegularApps() -> [(bundleID: String, name: String)] {
+        let own = Bundle.main.bundleIdentifier
+        return NSWorkspace.shared.runningApplications
+            .filter { $0.activationPolicy == .regular }
+            .compactMap { app -> (bundleID: String, name: String)? in
+                guard let id = app.bundleIdentifier, id != own else { return nil }
+                return (id, app.localizedName ?? id)
+            }
+            .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+    }
+
+    /// Look up a display name + icon for an arbitrary bundle id, including
+    /// apps that aren't currently running. Falls back to the raw id when the
+    /// app isn't installed.
+    private static func appRef(forBundleID id: String) -> (name: String, icon: NSImage?) {
+        guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: id) else {
+            return (id, nil)
+        }
+        let bundle = Bundle(url: url)
+        let name = (bundle?.localizedInfoDictionary?["CFBundleDisplayName"] as? String)
+            ?? (bundle?.infoDictionary?["CFBundleDisplayName"] as? String)
+            ?? (bundle?.infoDictionary?["CFBundleName"] as? String)
+            ?? url.deletingPathExtension().lastPathComponent
+        let icon = NSWorkspace.shared.icon(forFile: url.path)
+        return (name, icon)
     }
 
     private func commitListRename(for id: UUID) {
@@ -502,6 +700,77 @@ struct SettingsView: View {
         return merged
     }
 
+    // MARK: Permissions (continued below; DatasetSettingsView lives at file scope)
+}
+
+private struct DatasetSettingsView: View {
+    @EnvironmentObject private var settings: SettingsStore
+    @ObservedObject var recorder: DatasetRecorder
+
+    var body: some View {
+        Form {
+            Section("Speech dataset") {
+                Toggle(
+                    "Save audio + transcript for each dictation session",
+                    isOn: $settings.datasetCollectionEnabled
+                )
+                Text("Stores the raw 16 kHz mono audio your microphone produced together with the recognizer's finalized transcript. Deepgram word-level timestamps are saved alongside the text when available. Use this to build a personal corpus for fine-tuning a speech model on your own voice.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Section("Statistics") {
+                LabeledContent("Sessions") {
+                    Text("\(recorder.stats.sessionCount)")
+                        .monospacedDigit()
+                }
+                LabeledContent("Audio recorded") {
+                    Text(DatasetSettingsView.formatDuration(recorder.stats.totalAudioSeconds))
+                        .monospacedDigit()
+                }
+                LabeledContent("Words recognized") {
+                    Text("\(recorder.stats.totalWords)")
+                        .monospacedDigit()
+                }
+            }
+
+            Section("Location") {
+                Text(recorder.baseDirectory.path)
+                    .font(.callout.monospaced())
+                    .textSelection(.enabled)
+                    .foregroundStyle(.secondary)
+                HStack {
+                    Button("Reveal in Finder") {
+                        let url = recorder.sessionsDirectory
+                        NSWorkspace.shared.activateFileViewerSelecting([url])
+                    }
+                    Spacer()
+                }
+            }
+        }
+        .formStyle(.grouped)
+    }
+
+    /// Compact human-friendly duration. Sub-minute durations stay in seconds
+    /// (helpful when you've just started collecting); longer ones promote to
+    /// minutes / hours so the stat fits on one line.
+    private static func formatDuration(_ seconds: Double) -> String {
+        guard seconds.isFinite, seconds > 0 else { return "0s" }
+        let total = Int(seconds.rounded())
+        let hours = total / 3600
+        let minutes = (total % 3600) / 60
+        let secs = total % 60
+        if hours > 0 {
+            return "\(hours)h \(minutes)m"
+        }
+        if minutes > 0 {
+            return "\(minutes)m \(secs)s"
+        }
+        return "\(secs)s"
+    }
+}
+
+extension SettingsView {
     // MARK: Permissions
 
     private var permissionsTab: some View {

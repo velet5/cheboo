@@ -41,6 +41,9 @@ struct MenuContent: View {
             return settings.apiKey.isEmpty ? "⚠︎ No Deepgram API key set" : nil
         case .whisperServer:
             return settings.whisperServerURL.isEmpty ? "⚠︎ No Whisper server URL set" : nil
+        case .whisperLocal:
+            // On-device engine needs no key or URL — model downloads on first use.
+            return nil
         }
     }
 }
