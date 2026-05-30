@@ -331,7 +331,7 @@ struct SettingsView: View {
         case .english:
             return "Uses Deepgram nova-3, English only."
         case .russian:
-            return "Uses Deepgram nova-3 multilingual (covers Russian and other non-English languages nova-3 supports)."
+            return "Pins Russian: Whisper transcribes as ru; Deepgram nova-3 falls back to multilingual mode (it has no single-language Russian code)."
         }
     }
 
