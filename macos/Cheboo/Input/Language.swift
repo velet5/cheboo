@@ -55,8 +55,9 @@ enum LanguageMode: String, CaseIterable, Identifiable {
     }
 
     /// Resolve to a concrete dictation language. For `.automatic`, peek at the
-    /// current macOS keyboard input source: if it advertises English we use
-    /// English; anything else falls through to multilingual.
+    /// current macOS keyboard input source: an English layout pins English, a
+    /// Russian layout pins Russian, and anything else falls through to
+    /// multilingual auto-detect.
     func resolved() -> DictationLanguage {
         switch self {
         case .english: return .english
@@ -73,7 +74,11 @@ enum InputSourceLanguage {
         else { return .english }
 
         let langs = (Unmanaged<CFArray>.fromOpaque(raw).takeUnretainedValue() as? [String]) ?? []
-        if langs.first?.lowercased().hasPrefix("en") == true { return .english }
+        let primary = langs.first?.lowercased() ?? ""
+        // Pin the layouts Whisper has a concrete code for; everything else
+        // falls through to the multilingual auto-detect bucket.
+        if primary.hasPrefix("en") { return .english }
+        if primary.hasPrefix("ru") { return .russian }
         return .multilingual
     }
 }

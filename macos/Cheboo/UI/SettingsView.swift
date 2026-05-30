@@ -325,8 +325,12 @@ struct SettingsView: View {
     private var languageHint: String {
         switch settings.languageMode {
         case .automatic:
-            let current = LanguageMode.automatic.resolved()
-            let name = current == .english ? "English (nova-3)" : "Multilingual (nova-3)"
+            let name: String
+            switch LanguageMode.automatic.resolved() {
+            case .english: name = "English"
+            case .russian: name = "Russian (Whisper pins ru; Deepgram falls back to multilingual)"
+            case .multilingual: name = "Multilingual (auto-detect)"
+            }
             return "Following your current input source: \(name). Re-checked each time you start dictating."
         case .english:
             return "Uses Deepgram nova-3, English only."
