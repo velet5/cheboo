@@ -165,6 +165,29 @@ final class DictationController: ObservableObject {
         }
 
         let language = settings.languageMode.resolved()
+
+        // Resolve the per-app keyterm list once for every engine. Skip our own
+        // bundle id — if Cheboo's Settings window happens to be frontmost when
+        // the hotkey fires, fall through to the default list rather than
+        // matching a rule the user accidentally added. Deepgram sends these as
+        // `keyterm` params; the Whisper engines fold them into the decoder
+        // prompt (a comma-joined vocabulary hint) since Whisper has no keyterm
+        // concept of its own.
+        let ownBundleID = Bundle.main.bundleIdentifier
+        let frontmost = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
+        let focusedBundleID = (frontmost != ownBundleID) ? frontmost : nil
+        let resolved = settings.keyterms(forBundleID: focusedBundleID)
+        // Drop keyterms whose script doesn't match the transcription language
+        // before building the Whisper decoder prompt — a cross-script prompt
+        // makes Whisper return an empty transcript (see promptTerms). Deepgram
+        // still gets the full list; its keyterm biasing simply ignores terms it
+        // can't use rather than zeroing the output.
+        let promptTerms = language.promptTerms(from: resolved.terms)
+        Log.dictation.info(
+            "keyterms resolved — app=\(focusedBundleID ?? "nil", privacy: .public) list=\(resolved.listName ?? "—", privacy: .public) count=\(resolved.terms.count) whisperPrompt=\(promptTerms.count)"
+        )
+        let whisperPrompt = promptTerms.joined(separator: ", ")
+
         let newEngine: TranscriptionEngine
         switch settings.engineKind {
         case .deepgram:
@@ -172,16 +195,6 @@ final class DictationController: ObservableObject {
                 status = .error("Set a Deepgram API key in Settings.")
                 return
             }
-            // Skip our own bundle id — if Cheboo's Settings window happens to
-            // be frontmost when the hotkey fires, fall through to the default
-            // list rather than matching a rule the user accidentally added.
-            let ownBundleID = Bundle.main.bundleIdentifier
-            let frontmost = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
-            let focusedBundleID = (frontmost != ownBundleID) ? frontmost : nil
-            let resolved = settings.keyterms(forBundleID: focusedBundleID)
-            Log.dictation.info(
-                "keyterms resolved — app=\(focusedBundleID ?? "nil", privacy: .public) list=\(resolved.listName ?? "—", privacy: .public) count=\(resolved.terms.count)"
-            )
             newEngine = DeepgramSocket(
                 apiKey: settings.apiKey,
                 model: language.deepgramModel,
@@ -198,13 +211,15 @@ final class DictationController: ObservableObject {
             newEngine = WhisperServerEngine(
                 baseURL: settings.whisperServerURL,
                 apiKey: settings.whisperServerAPIKey,
-                language: language.whisperLanguage
+                language: language.whisperLanguage,
+                prompt: whisperPrompt
             )
         case .whisperLocal:
             newEngine = WhisperKitEngine(
                 modelName: settings.whisperKitModel,
                 language: language.whisperLanguage,
-                streaming: settings.whisperKitStreaming
+                streaming: settings.whisperKitStreaming,
+                prompt: whisperPrompt
             )
         }
 

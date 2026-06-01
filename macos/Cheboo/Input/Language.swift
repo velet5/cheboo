@@ -39,6 +39,55 @@ enum DictationLanguage {
     }
 }
 
+extension DictationLanguage {
+    /// Keep only keyterms whose script matches this language's, before they're
+    /// folded into a Whisper decoder prompt. A prompt in a different script than
+    /// the audio (e.g. Cyrillic keyterms while transcribing English under the
+    /// `<|en|>` token) conflicts with the language token and can make Whisper
+    /// return an *empty* transcript, so cross-script terms are dropped rather
+    /// than allowed to poison the decode.
+    ///
+    /// A term is dropped only if it contains a letter from a *different*
+    /// alphabet — same-script terms and script-neutral ones (digits, acronyms
+    /// like "R2", punctuation) are always kept. `.multilingual` auto-detects the
+    /// language, so the target script is unknown ahead of time and every term is
+    /// kept.
+    func promptTerms(from terms: [String]) -> [String] {
+        guard let target = promptScript else { return terms }
+        return terms.filter { term in
+            !term.unicodeScalars.contains { scalar in
+                guard let script = Self.script(of: scalar) else { return false }
+                return script != target
+            }
+        }
+    }
+
+    private enum Script { case latin, cyrillic }
+
+    private var promptScript: Script? {
+        switch self {
+        case .english: return .latin
+        case .russian: return .cyrillic
+        case .multilingual: return nil
+        }
+    }
+
+    /// Latin vs Cyrillic for letters in the ranges keyterms realistically use;
+    /// `nil` for digits, punctuation, and other scripts (which never conflict).
+    /// The `isAlphabetic` guard on the Latin range skips the two math symbols
+    /// (×, ÷) that share the Latin-1 Supplement block.
+    private static func script(of scalar: Unicode.Scalar) -> Script? {
+        switch scalar.value {
+        case 0x0400...0x052F:                                  // Cyrillic + Supplement
+            return .cyrillic
+        case 0x0041...0x005A, 0x0061...0x007A, 0x00C0...0x024F: // Latin + Latin-1/Extended
+            return scalar.properties.isAlphabetic ? .latin : nil
+        default:
+            return nil
+        }
+    }
+}
+
 enum LanguageMode: String, CaseIterable, Identifiable {
     case automatic
     case english

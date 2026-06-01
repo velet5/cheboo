@@ -23,6 +23,9 @@ final class WhisperServerEngine: TranscriptionEngine {
     private let baseURL: String
     private let apiKey: String
     private let language: String
+    /// Optional decoder prompt — a free-text vocabulary/style hint Whisper
+    /// conditions on (the OpenAI `prompt` form field). Empty = not sent.
+    private let prompt: String
     private let model: String
     private let urlSession: URLSession
     private let workerQueue = DispatchQueue(label: "com.github.velet5.cheboo.whisper-server")
@@ -33,11 +36,13 @@ final class WhisperServerEngine: TranscriptionEngine {
         baseURL: String,
         apiKey: String,
         language: String,
+        prompt: String = "",
         model: String = "whisper-1"
     ) {
         self.baseURL = baseURL
         self.apiKey = apiKey
         self.language = language
+        self.prompt = prompt
         self.model = model
         let config = URLSessionConfiguration.default
         // Whisper on cold-start with a large model can chew through 30-60s
@@ -126,6 +131,7 @@ final class WhisperServerEngine: TranscriptionEngine {
             wav: wav,
             model: model,
             language: language,
+            prompt: prompt,
             responseFormat: "json"
         )
 
@@ -244,6 +250,7 @@ final class WhisperServerEngine: TranscriptionEngine {
         wav: Data,
         model: String,
         language: String,
+        prompt: String,
         responseFormat: String
     ) -> Data {
         var body = Data()
@@ -262,6 +269,12 @@ final class WhisperServerEngine: TranscriptionEngine {
         // literal string "auto".
         if !language.isEmpty, language != "auto" {
             appendField(name: "language", value: language)
+        }
+        // Decoder prompt — biases vocabulary/spelling toward the active
+        // keyterms. OpenAI keeps only the last 224 tokens; whisper.cpp accepts
+        // it verbatim. Omitted when empty so we don't perturb plain dictation.
+        if !prompt.isEmpty {
+            appendField(name: "prompt", value: prompt)
         }
 
         body.append("--\(boundary)\(crlf)".data(using: .utf8)!)

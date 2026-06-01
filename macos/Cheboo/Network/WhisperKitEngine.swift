@@ -34,6 +34,9 @@ final class WhisperKitEngine: TranscriptionEngine, @unchecked Sendable {
     private let language: String?   // nil = let Whisper auto-detect
     /// When false, skip interim passes and only transcribe once on `stop()`.
     private let streaming: Bool
+    /// Free-text decoder prompt — a vocabulary/style hint Whisper conditions on
+    /// (the active keyterms, comma-joined). Empty = no prompt tokens.
+    private let prompt: String
     private let workerQueue = DispatchQueue(label: "com.github.velet5.cheboo.whisperkit")
 
     // Everything below is touched only on `workerQueue`.
@@ -50,10 +53,11 @@ final class WhisperKitEngine: TranscriptionEngine, @unchecked Sendable {
     /// piled up. Larger = less compute, choppier interims. (~1.0 s.)
     private static let interimSampleStride = 16_000
 
-    init(modelName: String, language: String, streaming: Bool) {
+    init(modelName: String, language: String, streaming: Bool, prompt: String = "") {
         self.modelName = modelName
         self.language = (language.isEmpty || language == "auto") ? nil : language
         self.streaming = streaming
+        self.prompt = prompt
     }
 
     func start() {
@@ -120,9 +124,10 @@ final class WhisperKitEngine: TranscriptionEngine, @unchecked Sendable {
         lastInterimSampleCount = samples.count
         transcribing = true
         let lang = language
+        let promptText = prompt
         Task { [weak self] in
             guard let self else { return }
-            let result = try? await Self.transcribe(wk, snapshot, language: lang, wordTimestamps: false)
+            let result = try? await Self.transcribe(wk, snapshot, language: lang, prompt: promptText, wordTimestamps: false)
             self.workerQueue.async {
                 self.transcribing = false
                 if let text = result?.text, !self.stopped {
@@ -149,6 +154,7 @@ final class WhisperKitEngine: TranscriptionEngine, @unchecked Sendable {
         guard !snapshot.isEmpty else { finish(error: nil); return }
         transcribing = true
         let lang = language
+        let promptText = prompt
         let preloaded = whisperKit
         let name = modelName
         Task { [weak self] in
@@ -160,7 +166,7 @@ final class WhisperKitEngine: TranscriptionEngine, @unchecked Sendable {
                 } else {
                     wk = try await WhisperKitModelManager.shared.model(named: name)
                 }
-                let result = try await Self.transcribe(wk, snapshot, language: lang, wordTimestamps: true)
+                let result = try await Self.transcribe(wk, snapshot, language: lang, prompt: promptText, wordTimestamps: true)
                 let text = (result?.text ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
                 let words: [TranscriptWord] = (result?.allWords ?? []).map {
                     TranscriptWord(
@@ -202,12 +208,21 @@ final class WhisperKitEngine: TranscriptionEngine, @unchecked Sendable {
         _ wk: WhisperKit,
         _ audio: [Float],
         language: String?,
+        prompt: String,
         wordTimestamps: Bool
     ) async throws -> TranscriptionResult? {
+        // Encode the prompt with the model's own tokenizer. WhisperKit prepends
+        // its start-of-prev token, trims to half the context window, and strips
+        // special tokens itself, so the raw encoding is safe to hand over. The
+        // leading space follows Whisper's prompt convention.
+        let promptTokens: [Int]? = prompt.isEmpty
+            ? nil
+            : wk.tokenizer?.encode(text: " \(prompt)")
         let options = DecodingOptions(
             task: .transcribe,
             language: language,
-            wordTimestamps: wordTimestamps
+            wordTimestamps: wordTimestamps,
+            promptTokens: promptTokens
         )
         let results = try await wk.transcribe(audioArray: audio, decodeOptions: options)
         return results.first
