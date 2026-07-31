@@ -51,6 +51,16 @@ struct SettingsView: View {
                 }
             }
 
+            if settings.engineKind == .gptTranscribe {
+                Section("OpenAI") {
+                    SecureField("API Key", text: $settings.openAIAPIKey, prompt: Text("paste from platform.openai.com"))
+                        .textFieldStyle(.roundedBorder)
+                    Text("Stored in the macOS Keychain, separately from the Deepgram key. Uses the gpt-transcribe model at $0.0045 per minute of audio. Your keyterm list is sent as keyword hints, which biases recognition toward those terms without forcing them into the transcript.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+
             if settings.engineKind == .whisperServer {
                 Section("Whisper server") {
                     TextField("Base URL", text: $settings.whisperServerURL, prompt: Text("http://127.0.0.1:8080"))
@@ -135,6 +145,8 @@ struct SettingsView: View {
         switch settings.engineKind {
         case .deepgram:
             return "Streams audio to Deepgram and shows interim text while you speak. Requires an API key (below) and a network connection."
+        case .gptTranscribe:
+            return "Uploads the full utterance to OpenAI's gpt-transcribe when you release the hotkey — typically a second or two, no live interim text. Accepts your keyterms as first-class keyword hints and handles mixed-language speech."
         case .whisperServer:
             return "POSTs the full utterance to an OpenAI-compatible Whisper endpoint when you release the hotkey. No live interim text. Works against a local whisper.cpp server or OpenAI cloud."
         case .whisperLocal:

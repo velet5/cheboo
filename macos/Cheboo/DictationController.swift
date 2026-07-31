@@ -170,9 +170,9 @@ final class DictationController: ObservableObject {
         // bundle id — if Cheboo's Settings window happens to be frontmost when
         // the hotkey fires, fall through to the default list rather than
         // matching a rule the user accidentally added. Deepgram sends these as
-        // `keyterm` params; the Whisper engines fold them into the decoder
-        // prompt (a comma-joined vocabulary hint) since Whisper has no keyterm
-        // concept of its own.
+        // `keyterm` params and gpt-transcribe as `keywords[]`; the Whisper
+        // engines fold them into the decoder prompt (a comma-joined vocabulary
+        // hint) since Whisper has no keyterm concept of its own.
         let ownBundleID = Bundle.main.bundleIdentifier
         let frontmost = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
         let focusedBundleID = (frontmost != ownBundleID) ? frontmost : nil
@@ -202,6 +202,21 @@ final class DictationController: ObservableObject {
                 punctuate: settings.autoPunctuation,
                 smartFormat: settings.autoCapitalization,
                 keyterms: resolved.terms
+            )
+        case .gptTranscribe:
+            guard !settings.openAIAPIKey.isEmpty else {
+                status = .error("Set an OpenAI API key in Settings → Engine.")
+                return
+            }
+            newEngine = GPTTranscribeEngine(
+                apiKey: settings.openAIAPIKey,
+                languages: language.gptTranscribeLanguages,
+                // Unfiltered, unlike the Whisper prompt: `keywords[]` are hints
+                // the model drops when it doesn't hear them, so a Cyrillic term
+                // sitting in an English list costs nothing. Filtering here would
+                // throw away exactly the cross-script product names (brands,
+                // library names) that keyterms exist to catch.
+                keywords: resolved.terms
             )
         case .whisperServer:
             guard !settings.whisperServerURL.isEmpty else {
@@ -241,6 +256,12 @@ final class DictationController: ObservableObject {
             case .deepgram:
                 datasetLanguage = language.deepgramLanguage
                 datasetModel = language.deepgramModel
+            case .gptTranscribe:
+                // Empty hints mean the model auto-detects, which is the same
+                // thing the Whisper engines label "auto".
+                let hints = language.gptTranscribeLanguages
+                datasetLanguage = hints.isEmpty ? "auto" : hints.joined(separator: ",")
+                datasetModel = GPTTranscribeEngine.model
             case .whisperServer:
                 datasetLanguage = language.whisperLanguage
                 datasetModel = "whisper-1"

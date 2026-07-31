@@ -37,6 +37,19 @@ enum DictationLanguage {
         case .multilingual: return "auto"
         }
     }
+
+    /// Language hints for OpenAI's `gpt-transcribe`, sent as repeated
+    /// `languages[]` form fields. Unlike Whisper's singular `language` this is a
+    /// *list* of languages the audio may contain, so the multilingual bucket
+    /// sends an empty one: the API rejects a literal "auto", and omitting the
+    /// field entirely is how detection is requested.
+    var gptTranscribeLanguages: [String] {
+        switch self {
+        case .english: return ["en"]
+        case .russian: return ["ru"]
+        case .multilingual: return []
+        }
+    }
 }
 
 extension DictationLanguage {

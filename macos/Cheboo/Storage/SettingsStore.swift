@@ -33,6 +33,7 @@ enum HUDPosition: String, CaseIterable, Identifiable {
 /// Which speech-to-text backend the dictation pipeline should drive.
 enum TranscriptionEngineKind: String, CaseIterable, Identifiable {
     case deepgram
+    case gptTranscribe
     case whisperServer
     case whisperLocal
 
@@ -41,6 +42,7 @@ enum TranscriptionEngineKind: String, CaseIterable, Identifiable {
     var label: String {
         switch self {
         case .deepgram: return "Deepgram (cloud, streaming)"
+        case .gptTranscribe: return "GPT Transcribe (OpenAI, batch)"
         case .whisperServer: return "Whisper API (OpenAI-compatible, batch)"
         case .whisperLocal: return "Whisper (on-device, Core ML)"
         }
@@ -287,12 +289,28 @@ final class SettingsStore: ObservableObject {
         didSet { UserDefaults.standard.set(datasetCollectionEnabled, forKey: Keys.datasetCollectionEnabled) }
     }
 
+    /// Deepgram API key.
     @Published var apiKey: String {
         didSet {
             if apiKey.isEmpty {
-                Keychain.delete()
+                Keychain.delete(.deepgram)
             } else if apiKey != oldValue {
-                Keychain.save(apiKey)
+                Keychain.save(apiKey, for: .deepgram)
+            }
+        }
+    }
+
+    /// OpenAI API key for the `gptTranscribe` engine. A separate Keychain item
+    /// from the Deepgram key so switching engines back and forth doesn't cost
+    /// the user a re-paste. Deliberately *not* shared with
+    /// `whisperServerAPIKey`, which lives in UserDefaults because it usually
+    /// holds nothing at all (local whisper.cpp servers take no auth).
+    @Published var openAIAPIKey: String {
+        didSet {
+            if openAIAPIKey.isEmpty {
+                Keychain.delete(.openAI)
+            } else if openAIAPIKey != oldValue {
+                Keychain.save(openAIAPIKey, for: .openAI)
             }
         }
     }
@@ -368,7 +386,8 @@ final class SettingsStore: ObservableObject {
         self.whisperKitStreaming = defaults.object(forKey: Keys.whisperKitStreaming) as? Bool ?? true
         self.preferredInputDeviceUID = defaults.string(forKey: Keys.preferredInputDeviceUID)
         self.datasetCollectionEnabled = defaults.object(forKey: Keys.datasetCollectionEnabled) as? Bool ?? false
-        self.apiKey = Keychain.load() ?? ""
+        self.apiKey = Keychain.load(.deepgram) ?? ""
+        self.openAIAPIKey = Keychain.load(.openAI) ?? ""
     }
 
     // MARK: - Keyterm list persistence

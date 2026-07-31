@@ -39,6 +39,8 @@ struct MenuContent: View {
         switch settings.engineKind {
         case .deepgram:
             return settings.apiKey.isEmpty ? "⚠︎ No Deepgram API key set" : nil
+        case .gptTranscribe:
+            return settings.openAIAPIKey.isEmpty ? "⚠︎ No OpenAI API key set" : nil
         case .whisperServer:
             return settings.whisperServerURL.isEmpty ? "⚠︎ No Whisper server URL set" : nil
         case .whisperLocal:
