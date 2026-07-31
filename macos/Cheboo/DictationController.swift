@@ -218,6 +218,16 @@ final class DictationController: ObservableObject {
                 // library names) that keyterms exist to catch.
                 keywords: resolved.terms
             )
+        case .gptLiveTranscribe:
+            guard !settings.openAIAPIKey.isEmpty else {
+                status = .error("Set an OpenAI API key in Settings → Engine.")
+                return
+            }
+            newEngine = GPTLiveTranscribeEngine(
+                apiKey: settings.openAIAPIKey,
+                languages: language.gptTranscribeLanguages,
+                keywords: resolved.terms
+            )
         case .whisperServer:
             guard !settings.whisperServerURL.isEmpty else {
                 status = .error("Set a Whisper server URL in Settings → Engine.")
@@ -262,6 +272,10 @@ final class DictationController: ObservableObject {
                 let hints = language.gptTranscribeLanguages
                 datasetLanguage = hints.isEmpty ? "auto" : hints.joined(separator: ",")
                 datasetModel = GPTTranscribeEngine.model
+            case .gptLiveTranscribe:
+                let hints = language.gptTranscribeLanguages
+                datasetLanguage = hints.isEmpty ? "auto" : hints.joined(separator: ",")
+                datasetModel = GPTLiveTranscribeEngine.model
             case .whisperServer:
                 datasetLanguage = language.whisperLanguage
                 datasetModel = "whisper-1"

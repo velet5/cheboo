@@ -28,7 +28,9 @@ struct MenuContent: View {
         // frontmost just because one of its windows is ordered front — the
         // Settings window opens *underneath* whatever app the user was in.
         // With no Dock icon and no Cmd-Tab entry (accessory apps are excluded
-        // from both), a buried Settings window is unreachable.
+        // from both), a buried Settings window is unreachable, and clicking
+        // this item again doesn't help: the window already exists, so opening
+        // it is a no-op that still leaves the app inactive.
         //
         // `openSettings` is the macOS 14 equivalent of SettingsLink's action,
         // and unlike the link it lets us activate alongside it — menu-style
@@ -72,7 +74,7 @@ struct MenuContent: View {
         switch settings.engineKind {
         case .deepgram:
             return settings.apiKey.isEmpty ? "⚠︎ No Deepgram API key set" : nil
-        case .gptTranscribe:
+        case .gptTranscribe, .gptLiveTranscribe:
             return settings.openAIAPIKey.isEmpty ? "⚠︎ No OpenAI API key set" : nil
         case .whisperServer:
             return settings.whisperServerURL.isEmpty ? "⚠︎ No Whisper server URL set" : nil

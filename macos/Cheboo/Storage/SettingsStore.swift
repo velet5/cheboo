@@ -34,6 +34,7 @@ enum HUDPosition: String, CaseIterable, Identifiable {
 enum TranscriptionEngineKind: String, CaseIterable, Identifiable {
     case deepgram
     case gptTranscribe
+    case gptLiveTranscribe
     case whisperServer
     case whisperLocal
 
@@ -43,6 +44,7 @@ enum TranscriptionEngineKind: String, CaseIterable, Identifiable {
         switch self {
         case .deepgram: return "Deepgram (cloud, streaming)"
         case .gptTranscribe: return "GPT Transcribe (OpenAI, batch)"
+        case .gptLiveTranscribe: return "GPT Live Transcribe (OpenAI, streaming)"
         case .whisperServer: return "Whisper API (OpenAI-compatible, batch)"
         case .whisperLocal: return "Whisper (on-device, Core ML)"
         }

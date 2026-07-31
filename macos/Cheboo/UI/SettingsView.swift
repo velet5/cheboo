@@ -51,11 +51,11 @@ struct SettingsView: View {
                 }
             }
 
-            if settings.engineKind == .gptTranscribe {
+            if settings.engineKind == .gptTranscribe || settings.engineKind == .gptLiveTranscribe {
                 Section("OpenAI") {
                     SecureField("API Key", text: $settings.openAIAPIKey, prompt: Text("paste from platform.openai.com"))
                         .textFieldStyle(.roundedBorder)
-                    Text("Stored in the macOS Keychain, separately from the Deepgram key. Uses the gpt-transcribe model at $0.0045 per minute of audio. Your keyterm list is sent as keyword hints, which biases recognition toward those terms without forcing them into the transcript.")
+                    Text(openAIKeyHint)
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -141,12 +141,26 @@ struct SettingsView: View {
         }
     }
 
+    /// Both OpenAI engines share the one key, so the shared preamble is
+    /// followed by whichever model is actually selected and what it costs.
+    private var openAIKeyHint: String {
+        let shared = "Stored in the macOS Keychain, separately from the Deepgram key. Your keyterm list is sent as keyword hints, which biases recognition toward those terms without forcing them into the transcript."
+        switch settings.engineKind {
+        case .gptLiveTranscribe:
+            return shared + " Uses gpt-live-transcribe at $0.017 per minute — about 3.8× gpt-transcribe, the price of live text."
+        default:
+            return shared + " Uses gpt-transcribe at $0.0045 per minute of audio."
+        }
+    }
+
     private var engineHint: String {
         switch settings.engineKind {
         case .deepgram:
             return "Streams audio to Deepgram and shows interim text while you speak. Requires an API key (below) and a network connection."
         case .gptTranscribe:
             return "Uploads the full utterance to OpenAI's gpt-transcribe when you release the hotkey — typically a second or two, no live interim text. Accepts your keyterms as first-class keyword hints and handles mixed-language speech."
+        case .gptLiveTranscribe:
+            return "Streams audio to OpenAI over a realtime socket and shows text as you speak, then commits the finished transcript when you release the hotkey. Costs about 3.8× the batch GPT Transcribe engine."
         case .whisperServer:
             return "POSTs the full utterance to an OpenAI-compatible Whisper endpoint when you release the hotkey. No live interim text. Works against a local whisper.cpp server or OpenAI cloud."
         case .whisperLocal:
