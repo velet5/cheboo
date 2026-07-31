@@ -56,6 +56,22 @@ enum InputDevices {
         availableDevices().first { $0.uid == uid }?.id
     }
 
+    /// The device's current nominal (hardware) sample rate. This is the
+    /// authoritative value to align AVAudioEngine's input node to — the node
+    /// itself can report a stale rate inherited from a previously-bound
+    /// device, which then breaks capture or `engine.start()`.
+    static func nominalSampleRate(_ deviceID: AudioDeviceID) -> Double? {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyNominalSampleRate,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var rate: Float64 = 0
+        var size = UInt32(MemoryLayout<Float64>.size)
+        let status = AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, &rate)
+        return status == noErr && rate > 0 ? Double(rate) : nil
+    }
+
     static func defaultInputDeviceID() -> AudioDeviceID? {
         var address = AudioObjectPropertyAddress(
             mSelector: kAudioHardwarePropertyDefaultInputDevice,

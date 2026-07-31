@@ -46,6 +46,12 @@ final class AudioEngine {
 
     private var engine = AVAudioEngine()
     private var converter: AVAudioConverter?
+    /// Source format the current `converter` was built for. The tap is
+    /// installed with `format: nil`, so the real input format only becomes
+    /// known when the first buffer arrives; we (re)build the converter lazily
+    /// against `buffer.format` and remember it here to avoid rebuilding on
+    /// every callback.
+    private var converterSourceFormat: AVAudioFormat?
     private let targetFormat: AVAudioFormat
     private let callbackQueue = DispatchQueue(label: "com.github.velet5.cheboo.audio")
     private var isRunning = false
@@ -146,6 +152,17 @@ final class AudioEngine {
         applyPreferredDevice()
 
         let input = engine.inputNode
+
+        // Force the input node's client format to the bound device's *actual*
+        // nominal sample rate. The node otherwise clings to a stale rate
+        // inherited from whatever device it first materialized against (e.g.
+        // 44100 Hz while a 48000 Hz interface is now selected), and that
+        // mismatch makes the HAL deliver no buffers — or makes engine.start()
+        // fail with -10868. We don't care what rate/channel-count the device
+        // uses; whatever it supplies, `process()` re-encodes to the 16 kHz mono
+        // target on the fly.
+        alignInputFormatToBoundDevice(input)
+
         let inputFormat = input.outputFormat(forBus: 0)
 
         Log.audio.info(
@@ -163,16 +180,24 @@ final class AudioEngine {
             )
         }
 
-        converter = AVAudioConverter(from: inputFormat, to: targetFormat)
-        if converter == nil {
-            Log.audio.error("failed to build AVAudioConverter from input to target format")
-        }
+        // Reset the converter so it gets rebuilt against the first tap
+        // buffer's real format (see `process`). We deliberately do NOT build it
+        // from `inputFormat` here: after binding a non-default device,
+        // `outputFormat(forBus:)` can report a stale sample rate (e.g. 44100
+        // while the hardware is really at 48000), and a converter built from
+        // that wrong rate silently drops every buffer.
+        converter = nil
+        converterSourceFormat = nil
 
         input.removeTap(onBus: 0)
 
         do {
             try ObjcExceptionGuard.catchException {
-                input.installTap(onBus: 0, bufferSize: 1024, format: inputFormat) { [weak self] buffer, _ in
+                // Pass `format: nil` so the tap adopts the input node's actual
+                // current bus format. Passing the pre-read `inputFormat` is
+                // what raised "Failed to create tap due to format mismatch"
+                // whenever that value had gone stale relative to the device.
+                input.installTap(onBus: 0, bufferSize: 1024, format: nil) { [weak self] buffer, _ in
                     self?.process(buffer)
                 }
             }
@@ -200,11 +225,68 @@ final class AudioEngine {
         } catch {
             Log.audio.error("engine.start() threw: \(error.localizedDescription, privacy: .public)")
             input.removeTap(onBus: 0)
-            throw error
+            if retrying {
+                throw error
+            }
+            // A fresh engine instance re-materializes the input node against
+            // the currently-bound device, clearing any poisoned format state
+            // the prior instance carried.
+            Log.audio.notice("recreating AVAudioEngine and retrying once after start failure")
+            engine = AVAudioEngine()
+            observeConfigChanges()
+            return try startEngine(retrying: true)
         }
         isRunning = true
-        lastStableInputFormat = inputFormat
+        lastStableInputFormat = input.outputFormat(forBus: 0)
         Log.audio.info("audio engine started")
+    }
+
+    /// Pin the input node's client format to the bound device's real nominal
+    /// sample rate so the node, the tap, and the hardware all agree. Without
+    /// this the AUHAL is asked to rate-convert between a stale node rate and
+    /// the live device rate and quietly produces no buffers (or refuses to
+    /// start). We keep the node's existing channel layout and the canonical
+    /// Float32 non-interleaved layout AVAudioEngine uses; only the rate is
+    /// corrected. Best-effort: if anything is unavailable we leave the node
+    /// untouched and let the normal start path proceed.
+    private func alignInputFormatToBoundDevice(_ input: AVAudioInputNode) {
+        guard activeInputDeviceID != 0,
+              let unit = input.audioUnit,
+              let deviceRate = InputDevices.nominalSampleRate(activeInputDeviceID),
+              deviceRate > 0
+        else { return }
+
+        let current = input.outputFormat(forBus: 0)
+        guard current.channelCount > 0, current.sampleRate != deviceRate else { return }
+
+        guard let aligned = AVAudioFormat(
+            commonFormat: .pcmFormatFloat32,
+            sampleRate: deviceRate,
+            channels: current.channelCount,
+            interleaved: false
+        ) else { return }
+
+        var asbd = aligned.streamDescription.pointee
+        // Element 1 / output scope is the AUHAL input element's client side —
+        // the format the engine reads from. That's what `outputFormat(forBus:)`
+        // surfaces and what the tap adopts.
+        let status = AudioUnitSetProperty(
+            unit,
+            kAudioUnitProperty_StreamFormat,
+            kAudioUnitScope_Output,
+            1,
+            &asbd,
+            UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
+        )
+        if status == noErr {
+            Log.audio.info(
+                "aligned input format to device rate \(current.sampleRate, privacy: .public)→\(deviceRate, privacy: .public) Hz channels=\(current.channelCount, privacy: .public)"
+            )
+        } else {
+            Log.audio.error(
+                "could not align input format to device rate \(deviceRate, privacy: .public) (status=\(status, privacy: .public))"
+            )
+        }
     }
 
     // MARK: - Input device selection
@@ -421,6 +503,17 @@ final class AudioEngine {
     // MARK: - Tap processing
 
     private func process(_ buffer: AVAudioPCMBuffer) {
+        // Build (or rebuild) the converter against the buffer's real format.
+        // Because the tap was installed with `format: nil`, this reflects what
+        // the hardware is actually delivering, regardless of any stale value
+        // `outputFormat(forBus:)` reported at install time.
+        if converter == nil || !(converterSourceFormat?.isEqual(buffer.format) ?? false) {
+            converter = AVAudioConverter(from: buffer.format, to: targetFormat)
+            converterSourceFormat = buffer.format
+            if converter == nil {
+                Log.audio.error("failed to build AVAudioConverter from input to target format")
+            }
+        }
         guard let converter else { return }
 
         let ratio = targetFormat.sampleRate / buffer.format.sampleRate
